@@ -150,17 +150,23 @@ Apple M3, macOS 26.4.1, rustc 1.98.0, Apple clang 21.0.0. Single threaded.
 stories15M (dim 288, 6 layers, 6 heads, vocab 32000, context 256), 248
 generated greedy tokens, 5 runs, median.
 
+Every row was measured in a single session with the same `run.c` binaries, so
+no row is quoted from a run with different machine load than the others. Run to
+run spread on this machine is a few percent, and the first run after a rebuild
+is reliably ~12% slow (page faults on the 60 MB checkpoint), so the medians are
+quoted and the digits are not meaningful.
+
 | engine | tok/s |
 |---|---|
-| tinyinfer, serial `.sum()` dot product | 153.3 |
-| tinyinfer, 8 accumulators, indexed loop | 207.8 |
-| tinyinfer, 8 accumulators, `chunks_exact` | 816.0 |
-| tinyinfer, same, plus `-C target-cpu=native` | 839.8 |
-| llama2.c `run.c`, `-O3 -march=native` | 152.1 |
-| llama2.c `run.c`, `-Ofast` | 977.9 |
+| tinyinfer, serial `.sum()` dot product | 154.3 |
+| tinyinfer, 8 accumulators, indexed loop | 207.9 |
+| tinyinfer, 8 accumulators, `chunks_exact` | 835.4 |
+| tinyinfer, same, plus `-C target-cpu=native` | 836.8 |
+| llama2.c `run.c`, `-O3 -march=native` | 146.8 |
+| llama2.c `run.c`, `-Ofast` | 973.6 |
 
 Greedy output is **byte-identical** to both `run.c` builds across all 248
-tokens.
+tokens, for all four tinyinfer variants.
 
 ### The 8-lane dot product, including the part I got wrong
 
@@ -171,7 +177,7 @@ change the answer. One loop-carried dependency per multiply is a latency wall
 that no amount of `-O3` gets past.
 
 Eight independent accumulators remove the dependency. That is the standard
-advice, and following it exactly gets you to 207.8 tok/s — a real 1.36x, and
+advice, and following it exactly gets you to 207.9 tok/s — a real 1.35x, and
 most of the way short of the real win.
 
 Written that way:
@@ -182,8 +188,8 @@ while i + 8 <= n { for lane in 0..8 { acc[lane] += a[i + lane] * b[i + lane]; } 
 
 the eight lanes become eight independent **scalar** chains. The dependency is
 gone, but LLVM's loop vectoriser does not fire on that form at all. Rewriting
-the identical arithmetic as `chunks_exact(8)` reaches 816.0 tok/s, a further
-3.9x, because it presents the eight values as one contiguous chunk and the
+the identical arithmetic as `chunks_exact(8)` reaches 835.4 tok/s, a further
+4.0x, because it presents the eight values as one contiguous chunk and the
 superword-level pass can pack them into vectors.
 
 Measured in isolation at `dim = 288` (the model's hidden size), in Gelem/s:
@@ -205,9 +211,9 @@ byte-identical comparison were all re-run after this change.
 
 ### The `-Ofast` gap, reported honestly
 
-`run.c -Ofast` is 977.9 tok/s and still faster than the 816.0 tok/s this
+`run.c -Ofast` is 973.6 tok/s and still faster than the 835.4 tok/s this
 engine reaches with an optimising Rust compiler and explicit SIMD. The gap is
-about 1.2x.
+about 1.17x.
 
 `-Ofast` enables `-ffast-math`, which lets clang reassociate floating-point
 additions *anywhere* it likes, including the attention and value-accumulation
@@ -216,15 +222,19 @@ reassociation in one function, because unrestricted reassociation across the
 whole forward pass makes the numerics much harder to reason about and much
 easier to break silently.
 
-The 1.2x is the price of that choice. It is a real cost, reported rather than
-hidden: the honest summary is that clang, allowed to assume the IEEE 754
-rules do not apply, extracts more than a conforming compiler can, and that
-some of what it extracts is available to a conforming compiler if you write
-the loop in the right shape — as the `chunks_exact` result above demonstrates —
-and some of it is not.
+The 1.17x is the price of that choice. It is a real cost, reported rather than
+hidden: the honest summary is that clang, allowed to assume the IEEE 754 rules
+do not apply, extracts more than a conforming compiler can, and that some of
+what it extracts is available to a conforming compiler if you write the loop in
+the right shape — as the `chunks_exact` result above demonstrates — and some of
+it is not.
 
-`target-cpu=native` adds about 3% (816.0 → 839.8) on this machine, which is
-much less than it gives on x86 with AVX-512 available.
+`-C target-cpu=native` adds 0.2% here (835.4 → 836.8), which is inside the
+run-to-run noise. That is worth stating plainly because it is not the result
+one would predict from an x86 machine with AVX-512: on aarch64 the baseline
+codegen already saturates the available NEON width for this loop, so there is
+nothing left for a more specific target to unlock. The `chunks_exact` rewrite,
+not the target flag, is what unlocked the vectorisation.
 
 ## Repository layout
 

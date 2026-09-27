@@ -175,10 +175,14 @@ because writing the eight lanes as an indexed inner loop
 chains: 2.2 → 3.3 Gelem/s at dim 288, which reads like success and is a quarter
 of the available win. Rewriting the identical arithmetic as `chunks_exact(8)`
 gets 14.6 Gelem/s, because it hands the SLP pass one contiguous chunk to pack.
-153 → 208 → 816 tok/s across the three variants. "Use eight accumulators" is
-advice that gets you most of the way and looks like it got all of it.
+154 → 208 → 835 tok/s across the three variants, all measured in one session.
+"Use eight accumulators" is advice that gets you most of the way and looks like
+it got all of it.
 
-**`run.c -Ofast` is still 1.2x faster** (978 vs 816 tok/s), because
+`-C target-cpu=native` adds 0.2% on aarch64 (835 → 837), inside the noise. The
+loop *shape*, not the target flag, is what unlocked the vectorisation.
+
+**`run.c -Ofast` is still 1.17x faster** (974 vs 835 tok/s), because
 `-ffast-math` lets clang reassociate anywhere, not just in one dot product.
 This is reported rather than hidden. Part of that gap is reachable by writing
 the loop in a shape the compiler likes; the rest is not, and the cost of not
