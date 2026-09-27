@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Checkpoints and weight files. These are large binary blobs and are not
+# reviewable in a diff, so they never belong in the repository.
+*.pt
+*.pth
+*.bin
+*.f32
+*.safetensors
+
+# ...with exactly one exception. The Llama 2 BPE vocabulary is a *test fixture*
+# here: tests/tokenizer.rs asserts our encoder reproduces the exact token ids
+# from Meta's own example scripts. We cannot assert that without the real file.
+!reference/llama2c/tokenizer.bin
+
+# Exported legacy-format checkpoints. diff_test.py writes these into a temp dir,
+# but a developer running the CLI by hand will drop some in the repo root.
+# /model.bin
+# /out.bin
+# /run.bin
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# The differential harness downloads this from Hugging Face on demand.
+stories15M.pt
+
+# Editor / OS noise
+.DS_Store
+.idea/
+*.swp

@@ -1,0 +1,194 @@
+# CONTEXT.md
+
+Design notes for `tinyinfer`. This is the working document I keep open while
+building, and the thing I would hand to a reviewer who asks "why is it like
+this?".
+
+## 1. What this is
+
+A Llama-architecture inference engine in Rust with **zero external crates**,
+plus the machinery that proves it computes the right thing.
+
+The engine is the easy half. The interesting half is the *testing story*:
+a differential harness that compares this engine's per-position logits against
+an independent reference implementation, and a mutation checker that proves the
+harness would have caught real bugs.
+
+## 2. Non-negotiable rules for this repo
+
+1. **Zero external dependencies.** `Cargo.lock` contains exactly one package.
+   Arg parsing, file IO, f32 math, the tokenizer, the CLI: all `std` only.
+2. **No fake green.** No `|| true`, no `continue-on-error`, no skipped
+   assertions, no tolerances widened until a failure disappears. If a check
+   fails, the bug is in my code, not in the check.
+3. **Do not tune numbers to match the reference.** A mismatch means I have a
+   real bug. Find it.
+4. **Every non-obvious decision gets a comment explaining the reasoning**, not
+   restating the code.
+
+## 3. Checkpoint format (llama2.c legacy "v0")
+
+Little-endian throughout. Header is 7 x i32:
+
+```
+dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size, seq_len
+```
+
+A **negative** `vocab_size` means the classifier is not tied to the token
+embedding: take the absolute value and expect a trailing `wcls` tensor.
+
+Then f32 tensors, per-layer tensors concatenated across layers:
+
+| tensor           | shape                          |
+|------------------|--------------------------------|
+| `token_embedding`| `vocab x dim`                  |
+| `rms_att`        | `layers x dim`                 |
+| `wq`             | `layers x dim x dim`           |
+| `wk`             | `layers x kv_dim x dim`        |
+| `wv`             | `layers x kv_dim x dim`        |
+| `wo`             | `layers x dim x dim`           |
+| `rms_ffn`        | `layers x dim`                 |
+| `w1`             | `layers x hidden x dim`        |
+| `w2`             | `layers x dim x hidden`        |
+| `w3`             | `layers x hidden x dim`        |
+| `rms_final`      | `dim`                          |
+| `freq_cis_real`  | `seq_len x head_size/2`  SKIP  |
+| `freq_cis_imag`  | `seq_len x head_size/2`  SKIP  |
+| `wcls`           | `vocab x dim` (untied only)    |
+
+`head_size = dim / n_heads`, `kv_dim = head_size * n_kv_heads`.
+
+**The RoPE tables are skipped on purpose.** The file *contains* `freq_cis`, and
+I could just read it. Computing RoPE myself in `ops::rope` means the
+differential test also exercises my RoPE maths instead of trusting a precomputed
+table that both implementations would then share. A shared precomputed table is
+a shared blind spot.
+
+### The loader treats the file as hostile input
+
+A checkpoint arrives from disk and its header decides how many bytes we are
+about to allocate. Every size product uses `checked_mul`, so an overflow is an
+`Err`, never a panic and never a silent wraparound that would hand out a
+short `Vec` that later gets indexed out of bounds. Trailing bytes are an error
+too, which is what catches a tensor-order mistake.
+
+## 4. The forward pass
+
+```
+x = token_embedding[token]
+for l in layers:
+    xb  = rmsnorm(x, rms_att[l])
+    q   = wq[l] @ xb
+    k   = wk[l] @ xb
+    v   = wv[l] @ xb
+    rope(q, pos); rope(k, pos)
+    key_cache[l][pos] = k; value_cache[l][pos] = v
+    for h in heads:
+        kv = h / (n_heads / n_kv_heads)          # grouped-query attention
+        score[t] = dot(q_h, key_cache[l][t][kv]) / sqrt(head_size)   for t in 0..=pos
+        softmax(score)
+        out_h = sum_t score[t] * value_cache[l][t][kv]
+    x += wo[l] @ out
+    xb = rmsnorm(x, rms_ffn[l])
+    x += w2[l] @ (silu(w1[l] @ xb) * (w3[l] @ xb))   # SwiGLU
+x  = rmsnorm(x, rms_final)
+logits = classifier @ x
+```
+
+Kernels:
+
+- `rmsnorm(x, w) = x / sqrt(mean(x^2) + 1e-5) * w`
+- `softmax`: subtract the max before `exp` (see Q3 in the interview list)
+- `rope`: within each head, rotate pair `(2i, 2i+1)` by `pos * 10000^(-2i/head_size)`
+- `silu(x) = x / (1 + exp(-x))`
+- `matmul(out, x, W, n, d)` where `W` is `d x n`, row-major
+
+All scratch and both caches are allocated once in `State` and reused. Positions
+must be fed `0, 1, 2, ...` in order, because every step appends to the cache.
+
+## 5. Tokenizer
+
+`tokenizer.bin`: `i32 max_token_length`, then per token `f32 score, i32 len,
+bytes`. 32000 tokens. Ids 0/1/2 are `<unk>`/BOS/EOS; ids 3..=258 are the byte
+fallbacks for `0x00..0xFF`.
+
+`encode` follows llama2.c exactly: BOS, then the SentencePiece dummy-prefix
+space, then per UTF-8 codepoint a vocab lookup or byte fallback, then greedily
+merge the highest-scoring adjacent pair until nothing merges.
+
+## 6. Differential testing
+
+`reference/diff_test.py` builds six small configs, randomises their weights,
+exports each with the reference `legacy_export`, runs the reference model in
+PyTorch and this engine in Rust, and requires:
+
+```
+|engine - ref| <= 1e-4 + 1e-4 * |ref|      at every position, every logit
+argmax agrees                               at every position
+```
+
+The two implementations share nothing but the file format. The reference does a
+batched forward pass with a causal mask; this engine decodes one token at a
+time with a KV cache, computes its own RoPE, and uses index-mapped GQA. That is
+the whole reason the test is worth anything: agreeing on logits means the two
+structurally different implementations agree on the maths.
+
+### Gotcha: default init hides bugs
+
+llama2.c initialises weights with `std=0.02`, which makes the logits nearly
+flat. Several genuinely wrong implementations still land inside `1e-4` of a flat
+reference. The harness therefore re-randomises: matrices as
+`randn / sqrt(fan_in)`, norm weights as `1 + 0.5 * randn`. The reference must
+also be told to return logits for *every* position rather than only the last
+(pass `targets=`), and `legacy_export` has to be wrapped in
+`contextlib.redirect_stdout` or it pollutes the report.
+
+## 7. Mutation testing
+
+A test that cannot fail is decoration. `reference/mutation_check.py` copies the
+crate, injects one realistic bug at a time, rebuilds, and requires the
+differential harness to exit non-zero. It asserts each replacement snippet
+occurs *exactly once*, so a refactor cannot silently turn a mutant into a no-op
+that trivially "passes".
+
+Ten mutants: RoPE exponent `2i`->`i`; RoPE skipped on k; GQA mapping
+`h / kv_mul` -> `h % n_kv_heads`; attention window `pos + 1` -> `pos.max(1)`;
+attention scale removed; RMSNorm eps `1e-5` -> `1e-27`; SwiGLU gate/up swapped;
+untied classifier ignored; residual `x += d` -> `x = d`; RoPE theta 10000 ->
+500000.
+
+Required result: **10/10 caught**. If one survives, the suite has a blind spot
+and the suite is what gets fixed.
+
+## 8. Performance
+
+Reported honestly, on whatever machine produced the numbers. The headline
+optimisation is the dot product: a serial `sum` chain is a loop-carried
+dependency that LLVM *cannot* vectorise, because floating-point addition is not
+associative and reassociating it would change the answer. Eight independent
+accumulators give it the freedom, and it does vectorise. That is worth roughly
+1.9x here. It also changes the last bits of the result, which is precisely why
+the comparison has to be tolerance-based rather than bitwise.
+
+## 9. Trusted computing base
+
+For the record, since it is the honest answer to "how much do you actually
+trust this?": the Rust compiler and `std`, the f32 semantics of the CPU, the
+checkpoint parsing code, and the reference implementation being tested against.
+Everything above those is tested; those are assumed and stated.
+
+## 10. Interview questions this has to answer without notes
+
+1. Why does a KV cache make decoding O(n) per token rather than O(n^2)?
+2. What does GQA save, and why is the head mapping `h / (n_heads / n_kv_heads)`?
+3. Why subtract the max in softmax?
+4. Why did the 8-accumulator dot product speed things up, and why did it change
+   the numbers?
+5. Why is `1e-4 + 1e-4 * |ref|` a reasonable tolerance, and what changes for
+   fp16?
+6. The diff test passed the first run. Why believe it can fail at all? (The
+   mutation check.)
+7. What would you verify first in Verus or Lean, and what is the property?
+   (Index safety of the KV-cache slicing in `forward` for any `pos < seq_len`;
+   or that `softmax` output is non-negative and sums to 1 within epsilon.)
+8. What is in the TCB?

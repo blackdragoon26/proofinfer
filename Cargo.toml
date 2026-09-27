@@ -1,0 +1,41 @@
+[package]
+name = "tinyinfer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A dependency-free Llama inference engine with a differential-testing story"
+license = "MIT"
+publish = false
+
+# Hard requirement of this project: zero external dependencies.
+# Everything (arg parsing, file IO, f32 math, the BPE tokenizer, the CLI) is
+# built on top of `std` only. `Cargo.lock` should contain exactly one package:
+# this crate. CI asserts that.
+[dependencies]
+
+[lib]
+name = "tinyinfer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tinyinfer"
+path = "src/main.rs"
+
+# Release profile tuned for inference throughput.
+#   lto            -> cross-crate inlining (only matters once there are crates,
+#                    but it also lets LLVM specialize the hot loops harder)
+#   codegen-units  -> 1 unit so LLVM sees the whole program as one module and
+#                    can vectorise the inner matmul/dot loops
+#   panic = abort  -> decoding is a hot loop; unwinding tables are dead weight
+#                    and this is a CLI, not a library that must survive a panic.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+# Debug keeps `debug-assertions` and integer overflow checks on (they are on by
+# default in dev). The loader tests rely on this: an overflow in a size product
+# must be caught at runtime in a debug build, not silently wrapped in release.
+[profile.test]
+opt-level = 1
