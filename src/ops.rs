@@ -204,7 +204,7 @@ pub fn softmax(x: &mut [f32]) {
     scale_in_place(x, inv);
 }
 
-/// SiLU / swish: `x * sigmoid(x)`.
+/// Apply SiLU / swish: `x * sigmoid(x)`.
 ///
 /// Written as `x / (1 + exp(-x))` rather than the sigmoid form because the
 /// exponential is evaluated once. For large positive `x` this underflows
@@ -212,22 +212,14 @@ pub fn softmax(x: &mut [f32]) {
 /// `x`, `exp(-x)` overflows to `inf` and the result is `x/inf = -0.0`, which is
 /// the correct limit. So there is no input for which this produces `NaN`, and
 /// no clamping is needed.
+///
+/// There is deliberately no in-place variant. The only caller is the SwiGLU
+/// step, which needs `silu(gate) * up` and so has to read `gate` and write
+/// back in one expression; an `&mut f32` wrapper would have been one more name
+/// for the same arithmetic and one more thing to keep correct.
 #[inline]
 pub fn silu_value(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
-}
-
-/// Apply [`silu_value`] to one element in place.
-#[inline]
-pub fn silu(x: &mut f32) {
-    *x = silu_value(*x);
-}
-
-/// Apply [`silu_value`] to every element in place.
-pub fn silu_in_place(v: &mut [f32]) {
-    for x in v.iter_mut() {
-        *x = silu_value(*x);
-    }
 }
 
 /// `out = W @ x` where `W` is `d x n` stored row-major and `x` has length `n`.
@@ -706,20 +698,23 @@ mod tests {
 
     #[test]
     fn silu_is_zero_at_zero_and_linear_for_large_positive_input() {
-        let mut x = 0.0f32;
-        silu(&mut x);
-        assert_close(x, 0.0, 1e-7);
+        assert_close(silu_value(0.0), 0.0, 1e-7);
 
-        let mut x = 100.0f32;
-        silu(&mut x);
         // For x >> 0, sigmoid(x) -> 1, so silu(x) -> x.
-        assert_close(x, 100.0, 1e-3);
+        assert_close(silu_value(100.0), 100.0, 1e-3);
 
-        let mut x = -100.0f32;
-        silu(&mut x);
         // For x << 0 the result tends to 0 from below, and must not be NaN.
+        let x = silu_value(-100.0);
         assert!(x.is_finite(), "silu(-100) = {x}");
         assert!(x <= 0.0 && x > -1e-30, "silu(-100) = {x}");
+
+        // swish(x) = x * sigmoid(x), checked against the definition it is
+        // meant to implement, so the `x / (1 + exp(-x))` form cannot drift
+        // from the textbook one.
+        for &v in &[-3.5f32, -1.0, -0.25, 0.0, 0.25, 1.0, 3.5] {
+            let sigmoid = 1.0 / (1.0 + (-v).exp());
+            assert_close(silu_value(v), v * sigmoid, 1e-6);
+        }
     }
 
     /// A hand-rolled single-head, single-KV-head attention case where the

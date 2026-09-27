@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use tinyinfer::tokenizer::{Tokenizer, BOS_ID, EOS_ID, LLAMA2_VOCAB_SIZE};
+use tinyinfer::tokenizer::{Tokenizer, BOS_ID, EOS_ID, LLAMA2_VOCAB_SIZE, UNK_ID};
 
 fn tokenizer() -> Tokenizer {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference/llama2c/tokenizer.bin");
@@ -280,7 +280,7 @@ fn special_ids_are_where_the_specification_says() {
     let t = tokenizer();
     assert_eq!(t.piece(BOS_ID), Some(&b"\n<s>\n"[..]));
     assert_eq!(t.piece(EOS_ID), Some(&b"\n</s>\n"[..]));
-    assert_eq!(t.piece(0), Some(&b"<unk>"[..]));
+    assert_eq!(t.piece(UNK_ID), Some(&b"<unk>"[..]));
     // The dummy prefix is a plain single-space token.
     assert_eq!(t.id_of(b" "), Some(29871));
 }
