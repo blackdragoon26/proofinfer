@@ -482,12 +482,36 @@ sha256 GitHub publishes for that asset, installs the toolchain Verus asks for
 hardcoding a version), and runs the verifier. Verus is not a dependency of
 this crate and is not vendored.
 
-**One caveat, stated plainly:** that job's logic was dry-run locally and passes
-all four steps, but the Verus *run* was verified on macOS/arm64. The Linux
-x86-64 download and execution are the one part of this repository that has not
-been executed, because this machine is not a GitHub runner. If that job goes red
-on the first run, the citation check and the other three jobs are unaffected,
-and the log will name the step.
+That job was executed, not just reasoned about. Its steps were run verbatim in
+an emulated **x86_64 Linux** container — the same architecture and OS family as
+GitHub's `ubuntu-latest` — and produced:
+
+```
+--- 2. Fetch and unpack Verus (x86-linux) ---
+-rw-r--r-- 1 root root 485678212 verus.zip
+verus.zip: OK                      # sha256 matched the pinned digest
+unpacked: 1.6G
+--- 3. Locate the Verus binary ---
+Found Verus at verus-dist/verus-x86-linux/verus
+--- 4. Install the toolchain Verus requires ---
+verus: required rust toolchain 1.98.1-x86_64-unknown-linux-gnu not found
+  rustup install 1.98.1-x86_64-unknown-linux-gnu
+Verus requires: 1.98.1-x86_64-unknown-linux-gnu
+--- 5. Verify the KV-cache index-safety proof ---
+verification results:: 24 verified, 0 errors
+```
+
+That run is also what justified the ANSI-colour fix in the toolchain-discovery
+step: on Linux the parse still had to strip the escape sequence to recover
+`1.98.1-x86_64-unknown-linux-gnu` from the same coloured error message.
+
+**What is still unexecuted, precisely:** the GitHub-hosted actions themselves —
+`actions/checkout`, `actions/cache`, `actions/setup-python` and
+`dtolnay/rust-toolchain`. Those are standard, they are not written here, and the
+container provided its own `curl`/`unzip`/`python3`/`rustup` in their place. The
+remaining risk on a first CI run is therefore in the YAML and the runner
+environment, not in the commands this repository contributes. If the `proof` job
+does go red, the other three jobs are unaffected and the log will name the step.
 
 Nothing else here is machine-checked. The loader's totality rests on 2000 fuzz
 iterations plus reasoning, not a proof; the differential test establishes
