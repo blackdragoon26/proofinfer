@@ -13,5 +13,6 @@
 //! * [`model`]     - config, checkpoint loading, scratch + KV cache, forward
 //! * [`tokenizer`] - the Llama 2 BPE vocabulary reader and encoder
 
-// `model` and `tokenizer` land in the following commits.
+// `tokenizer` lands in the following commit.
+pub mod model;
 pub mod ops;
