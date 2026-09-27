@@ -219,6 +219,11 @@ Everything above those is tested; those are assumed and stated.
 6. The diff test passed the first run. Why believe it can fail at all? (The
    mutation check.)
 7. What would you verify first in Verus or Lean, and what is the property?
-   (Index safety of the KV-cache slicing in `forward` for any `pos < seq_len`;
-   or that `softmax` output is non-negative and sums to 1 within epsilon.)
+   (Index safety of the KV-cache slicing in `forward` for any `pos < seq_len`.)
+   This one is no longer hypothetical: `verus/` proves it, 24 conditions, all
+   discharged by Verus under `--no-cheating`. What it does *not* do is verify
+   the crate. It is a model of the indexing arithmetic whose correspondence to
+   `src/ops.rs` and `src/model.rs` is a human transcription, and a refactor
+   would leave it verifying a description of code that no longer exists. The
+   proof file says so in its own caveats, which is the point.
 8. What is in the TCB?

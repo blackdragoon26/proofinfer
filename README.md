@@ -248,7 +248,8 @@ tinyinfer/
     mutation_check.py        proof the harness can fail
     bench.py                 benchmark + byte-identity check
     llama2c/                 vendored UNMODIFIED from karpathy/llama2.c (MIT)
-  verus/                     index-safety proof (see its README for status)
+  verus/                     Verus proof of KV-cache index safety (24 conditions,
+                             machine-checked; see its README for the scope)
   .github/workflows/ci.yml   three jobs, no `|| true`, no continue-on-error
 ```
 
@@ -355,24 +356,46 @@ checkpoint parsing code, and the reference implementation being tested against.
 Everything above those is tested. Those are assumed, and the assumption is
 written down rather than implied.
 
-## What I would verify first, and what is not verified here
+## What is formally verified, and what is not
 
 The first thing worth proving mechanically is **index safety of the KV-cache
 slicing in `forward`**: that for any `pos < seq_len` and any layer, every cache
-index computed in `ops::attention` and `State::forward` is in bounds. It is a
-small, self-contained property about integer arithmetic, it is exactly the kind
-of thing a verifier is good at, and it is the class of bug that Rust's runtime
-bounds checks turn into a panic rather than silent corruption — which means
-testing can cover it but cannot *prove* it.
+index computed in `ops::attention` and `State::forward` is in bounds.
 
-`verus/` contains a Verus proof attempt for that lemma. **Read
-`verus/README.md` for its verification status before relying on it**; the
-status there is stated explicitly, and an unverified proof sketch is labelled
-as one.
+`verus/` contains a Verus development for exactly that, and it is
+**machine-checked**: Verus `0.2026.09.20.aef82ed` reports
+`24 verified, 0 errors` under `--no-cheating`, which rejects `assume`, `admit`
+and `external_body` outright. That is a real run, not a claim.
 
-Nothing in this repository is machine-checked beyond the test suite and the CI
-runs described above. The loader's totality is established by 2000 fuzz
-iterations plus reasoning, not by a proof; the differential test establishes
+What is proved: the bounds of every KV-cache index expression for all shapes
+satisfying the loader's structural preconditions and all `pos < seq_len`; that
+those preconditions follow from the checks the loader actually performs; that
+the GQA mapping `h / kv_mul` lands in `0..n_kv_heads`; and that the index
+arithmetic cannot overflow `usize`. The real slice expressions are transcribed
+into `exec fn`s operating on actual `Vec<f32>`, so Verus discharges genuine
+slice-indexing obligations rather than assertions about symbolic expressions.
+
+What is **not** proved, and `verus/README.md` lists eleven items of which these
+are the two that matter most:
+
+1. **It is a proof about a transcription, not about the crate.** `src/ops.rs`
+   and `src/model.rs` contain no `verus!` macro and are not compiled by Verus.
+   If someone changed an index expression, this file would keep verifying and
+   would simply be describing the old code. The line-number table in
+   `verus/README.md` is the only thing that would flag such a drift, and it
+   flags it by eye, not by machine. (I re-derived all 31 of those citations
+   against the current commit when reviewing it.)
+2. **Bounds safety does not catch wrong-but-in-bounds bugs.** Mutant #3
+   (`h / kv_mul` -> `h % n_kv_heads`) is also in range and sails straight
+   through. That is the boundary between what a verifier can say and what only
+   the differential test can say, and the proof file says so itself.
+
+Verus is not a dependency of this crate and is not vendored — it is a 449 MB
+prebuilt release, and it is **not** part of CI. Reproducing the check is a
+manual three-step command in `verus/README.md`.
+
+Nothing else here is machine-checked. The loader's totality rests on 2000 fuzz
+iterations plus reasoning, not a proof; the differential test establishes
 agreement with a reference on six configurations and one trained checkpoint,
 not equivalence to the architecture in general.
 
