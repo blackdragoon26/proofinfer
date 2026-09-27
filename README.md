@@ -184,9 +184,18 @@ the eight lanes become eight independent **scalar** chains. The dependency is
 gone, but LLVM's loop vectoriser does not fire on that form at all. Rewriting
 the identical arithmetic as `chunks_exact(8)` reaches 816.0 tok/s, a further
 3.9x, because it presents the eight values as one contiguous chunk and the
-superword-level pass can pack them into vectors. Measured in isolation at
-`dim = 288`: 1.5 Gelem/s serial, 3.3 Gelem/s eight indexed lanes, 14.6
-Gelem/s `chunks_exact`.
+superword-level pass can pack them into vectors.
+
+Measured in isolation at `dim = 288` (the model's hidden size), in Gelem/s:
+
+| dot product form | Gelem/s |
+|---|---|
+| serial `.sum()` | 2.2 |
+| 8 accumulators, indexed loop | 3.3 |
+| 8 accumulators, `chunks_exact(8)` | 14.6 |
+
+The indexed form is a 1.5x on the kernel, and looks like the optimisation
+worked. It is 4.4x short of what the same arithmetic can do.
 
 Nothing is reassociated in either version. Each lane is still a strict
 left-to-right sum; the eight lanes are just eight interleaved ordered sums. The
@@ -366,6 +375,15 @@ runs described above. The loader's totality is established by 2000 fuzz
 iterations plus reasoning, not by a proof; the differential test establishes
 agreement with a reference on six configurations and one trained checkpoint,
 not equivalence to the architecture in general.
+
+Two other things were scoped and deliberately **not** done, rather than
+half-done: a differential test against **vLLM** (needs a GPU and a Hugging Face
+export path, and the harness is written so that adding a third oracle is a new
+config table rather than a new file), and **Triton** kernels for rmsnorm,
+softmax and matmul (a benchmarking exercise with no bearing on whether the
+engine is correct, which is the claim this repository makes). The measurement
+in this repository is CPU and single-threaded throughout; nothing here says
+anything about GPU inference.
 
 ## Credits
 
