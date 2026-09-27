@@ -682,10 +682,11 @@ impl State {
         let kv_layer_stride = cfg.seq_len * kv_dim;
 
         // --- token embedding ----------------------------------------------
-        // The embedding lookup is a copy rather than a slice borrow because
-        // `self.x` is mutated later in this same function; borrowing `w`
-        // immutably across the whole body is fine, but aliasing `self.x` with a
-        // `&w.tok_embedding` slice would not be.
+        // The lookup is a copy rather than a borrowed view. `x` is the residual
+        // stream and it is accumulated into (`x[i] += ...`) at two points in
+        // every layer, so it has to be owned scratch; it cannot alias
+        // `w.tok_embedding` for the duration of the loop. The copy is one
+        // memcpy of `dim` floats per token, which is noise next to the matmuls.
         let row = token as usize * d;
         self.x.copy_from_slice(&w.tok_embedding[row..row + d]);
 
