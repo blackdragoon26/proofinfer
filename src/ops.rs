@@ -134,20 +134,26 @@ pub fn softmax(x: &mut [f32]) {
 /// SiLU / swish: `x * sigmoid(x)`.
 ///
 /// Written as `x / (1 + exp(-x))` rather than the sigmoid form because the
-/// exponential is evaluated once. For large positive `x` this overflows
+/// exponential is evaluated once. For large positive `x` this underflows
 /// `exp(-x)` towards zero (harmless, result tends to `x`); for large negative
 /// `x`, `exp(-x)` overflows to `inf` and the result is `x/inf = -0.0`, which is
 /// the correct limit. So there is no input for which this produces `NaN`, and
 /// no clamping is needed.
 #[inline]
-pub fn silu(x: &mut f32) {
-    *x = *x / (1.0 + (-*x).exp());
+pub fn silu_value(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
 }
 
-/// Apply SiLU to every element in place.
+/// Apply [`silu_value`] to one element in place.
+#[inline]
+pub fn silu(x: &mut f32) {
+    *x = silu_value(*x);
+}
+
+/// Apply [`silu_value`] to every element in place.
 pub fn silu_in_place(v: &mut [f32]) {
     for x in v.iter_mut() {
-        silu(x);
+        *x = silu_value(*x);
     }
 }
 

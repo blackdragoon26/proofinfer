@@ -4,7 +4,7 @@ use std::error::Error;
 use std::fmt;
 use std::path::Path;
 
-use crate::ops::AttentionDims;
+use crate::ops::{self, AttentionDims};
 
 /// Everything that goes wrong while reading a checkpoint.
 ///
@@ -59,6 +59,43 @@ impl fmt::Display for LoadError {
 }
 
 impl Error for LoadError {}
+
+/// Errors from running the model.
+///
+/// Separate from [`LoadError`] because these are not about a bad file: they
+/// are about the *caller* asking for something the model cannot do, such as a
+/// token outside the vocabulary or a position beyond the KV cache. Both are
+/// recoverable and both are the caller's mistake, so they get their own type
+/// rather than being folded into the loader's error space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    TokenOutOfRange { token: u32, vocab_size: usize },
+    PositionOutOfRange { pos: usize, seq_len: usize },
+    TooManyTokens { requested: usize, seq_len: usize },
+    EmptyPrompt,
+}
+
+impl fmt::Display for RunError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RunError::TokenOutOfRange { token, vocab_size } => write!(
+                f,
+                "token {token} is outside the vocabulary (0..{vocab_size})"
+            ),
+            RunError::PositionOutOfRange { pos, seq_len } => write!(
+                f,
+                "position {pos} is past the end of the KV cache (seq_len = {seq_len})"
+            ),
+            RunError::TooManyTokens { requested, seq_len } => write!(
+                f,
+                "{requested} tokens will not fit in a context of {seq_len}"
+            ),
+            RunError::EmptyPrompt => write!(f, "the prompt contains no tokens"),
+        }
+    }
+}
+
+impl Error for RunError {}
 
 /// Model architecture, as declared by the checkpoint header.
 ///
@@ -498,4 +535,335 @@ impl Weights {
     pub fn classifier(&self) -> &[f32] {
         self.wcls.as_deref().unwrap_or(&self.tok_embedding)
     }
+}
+
+/// All mutable buffers a decode step needs, allocated once.
+///
+/// The design rule is that `forward` performs **no allocation**. Every buffer
+/// here is sized from the config in [`State::new`] and then written in place for
+/// the life of the object. That matters for two reasons: an allocator call in
+/// the inner loop is measurable at these timescales, and a `forward` that could
+/// allocate is a `forward` whose memory behaviour is not obvious from reading
+/// it. Keeping the whole working set visible in one struct makes the memory
+/// footprint of decoding a sum you can write down:
+///
+/// ```text
+/// scratch   ~ 2*dim + hidden + 2*kv_dim + 2*q_dim + vocab
+/// kv cache  ~ 2 * n_layers * seq_len * kv_dim      <- the dominant term
+/// ```
+///
+/// The cache dominates, and it dominates because it is the whole point: it is
+/// what makes decoding O(n) per token rather than O(n^2). See
+/// [`State::forward`].
+#[derive(Debug, Clone)]
+pub struct State {
+    /// The residual stream. This is the vector that flows through the layers.
+    pub x: Vec<f32>,
+    /// Generic scratch for a normalised or projected activation.
+    xb: Vec<f32>,
+    /// SwiGLU gate output (`w1 @ xb`).
+    hb: Vec<f32>,
+    /// SwiGLU up output (`w3 @ xb`). Separate from `hb` because both are
+    /// needed simultaneously to form `silu(gate) * up`.
+    hb2: Vec<f32>,
+    /// Query for this step, `n_heads * head_size`.
+    q: Vec<f32>,
+    /// Key for this step, `n_kv_heads * head_size`.
+    k: Vec<f32>,
+    /// Value for this step, `n_kv_heads * head_size`.
+    v: Vec<f32>,
+    /// Attention output for this step, `n_heads * head_size`, before `wo`.
+    att: Vec<f32>,
+    /// Final logits, `vocab_size`.
+    pub logits: Vec<f32>,
+    /// Attention score scratch, `seq_len`, reused across every head.
+    scores: Vec<f32>,
+
+    /// `n_layers * seq_len * kv_dim`, row `l * seq_len + t` holding the keys
+    /// for layer `l` at position `t`.
+    key_cache: Vec<f32>,
+    /// Same layout, for values.
+    value_cache: Vec<f32>,
+}
+
+impl State {
+    /// Allocate every buffer for a given model.
+    ///
+    /// The cache allocation is a product of three header-derived numbers, so it
+    /// uses the same checked arithmetic as the loader. A header that validated
+    /// structurally can still describe a cache larger than memory (a 32-layer
+    /// 2048-context 4096-dim model is 4 GiB of f32 per cache), and that has to
+    /// be a clean `Err` at construction rather than an abort in the middle of
+    /// the first forward pass.
+    pub fn new(config: &Config) -> Result<Self, LoadError> {
+        let dims = config.attention_dims()?;
+        let d = config.dim;
+        let q_dim = dims.q_dim();
+        let kv_dim = dims.kv_dim();
+        let cache = config
+            .n_layers
+            .checked_mul(config.seq_len)
+            .and_then(|n| n.checked_mul(kv_dim))
+            .ok_or(LoadError::Overflow { what: "kv cache" })?;
+
+        Ok(State {
+            x: vec![0.0; d],
+            xb: vec![0.0; d],
+            hb: vec![0.0; config.hidden_dim],
+            hb2: vec![0.0; config.hidden_dim],
+            q: vec![0.0; q_dim],
+            k: vec![0.0; kv_dim],
+            v: vec![0.0; kv_dim],
+            att: vec![0.0; q_dim],
+            logits: vec![0.0; config.vocab_size],
+            scores: vec![0.0; config.seq_len],
+            key_cache: vec![0.0; cache],
+            value_cache: vec![0.0; cache],
+        })
+    }
+
+    /// Forget the KV cache, so the same `State` can decode a new sequence.
+    ///
+    /// Zeroing rather than tracking a high-water mark: the cache is written
+    /// before it is read at every position, so stale entries are never
+    /// observable, and this keeps `forward` free of any "is this position
+    /// fresh" bookkeeping.
+    pub fn reset(&mut self) {
+        self.key_cache.fill(0.0);
+        self.value_cache.fill(0.0);
+    }
+
+    /// Number of floats held by each KV cache. Exposed so the CLI can report
+    /// the memory the cache is actually using.
+    pub fn cache_len(&self) -> usize {
+        self.key_cache.len()
+    }
+
+    /// Run one token at `pos` and return the resulting logits.
+    ///
+    /// # Why this is O(n) per token rather than O(n^2)
+    ///
+    /// A transformer block needs, for the current token, the keys and values of
+    /// *every* previous token. Without a cache you would recompute all of them
+    /// from scratch, which for token `t` means re-running the whole prefix:
+    /// total work O(t^2) over a sequence. But the keys and values of position
+    /// `s` depend only on the token at `s` and on the layer-`(l-1)` activations
+    /// at `s` - never on any later token. So once computed they are valid
+    /// forever, and the only thing that changes is that another one becomes
+    /// available. Caching them turns each step into "compute this token's own
+    /// k and v, append, attend over the `pos + 1` entries that now exist":
+    /// O(t) work per step, O(n^2) total but with a tiny constant, and O(1) extra
+    /// work compared to a cached implementation.
+    ///
+    /// The price is that the cache is the memory cost listed on [`State`], and
+    /// that positions must be filled in order. Feeding position 7 before
+    /// position 3 would leave a hole that attention would read as zeros, which
+    /// is why `pos` is an explicit argument rather than an internal counter: the
+    /// ordering is the caller's responsibility and should be visible.
+    pub fn forward(&mut self, w: &Weights, token: u32, pos: usize) -> Result<&[f32], RunError> {
+        let cfg = &w.config;
+        if token as usize >= cfg.vocab_size {
+            return Err(RunError::TokenOutOfRange {
+                token,
+                vocab_size: cfg.vocab_size,
+            });
+        }
+        if pos >= cfg.seq_len {
+            return Err(RunError::PositionOutOfRange {
+                pos,
+                seq_len: cfg.seq_len,
+            });
+        }
+
+        let dims = w.attention_dims();
+        let d = cfg.dim;
+        let q_dim = dims.q_dim();
+        let kv_dim = dims.kv_dim();
+        let kv_layer_stride = cfg.seq_len * kv_dim;
+
+        // --- token embedding ----------------------------------------------
+        // The embedding lookup is a copy rather than a slice borrow because
+        // `self.x` is mutated later in this same function; borrowing `w`
+        // immutably across the whole body is fine, but aliasing `self.x` with a
+        // `&w.tok_embedding` slice would not be.
+        let row = token as usize * d;
+        self.x.copy_from_slice(&w.tok_embedding[row..row + d]);
+
+        for l in 0..cfg.n_layers {
+            // --- attention --------------------------------------------------
+            // Normalise, then project. rmsnorm before the QKV matmuls is what
+            // keeps the dot products in a sane numeric range; the learned scale
+            // is per-channel and is part of the architecture, not an
+            // afterthought.
+            ops::rmsnorm(&mut self.xb, &self.x, w.rms_att_layer(l));
+            ops::matmul(&mut self.q, &self.xb, w.wq_layer(l), q_dim, d);
+            ops::matmul(&mut self.k, &self.xb, w.wk_layer(l), kv_dim, d);
+            ops::matmul(&mut self.v, &self.xb, w.wv_layer(l), kv_dim, d);
+
+            // RoPE is applied to q and k but never to v. Values are content,
+            // not position: the position information is already carried by the
+            // keys, and rotating the values would double-count it.
+            ops::rope(&mut self.q, dims.n_heads, dims.head_size, pos);
+            ops::rope(&mut self.k, dims.n_kv_heads, dims.head_size, pos);
+
+            // Append this position's k and v to the cache for this layer.
+            let base = l * kv_layer_stride + pos * kv_dim;
+            self.key_cache[base..base + kv_dim].copy_from_slice(&self.k);
+            self.value_cache[base..base + kv_dim].copy_from_slice(&self.v);
+
+            // Attend over exactly the rows written so far. The cache slice is
+            // the whole layer; `attention` only reads the first `pos + 1` rows,
+            // so the rest being stale is harmless.
+            let layer_start = l * kv_layer_stride;
+            let layer_end = layer_start + kv_layer_stride;
+            ops::attention(
+                &mut self.att,
+                &self.q,
+                &self.key_cache[layer_start..layer_end],
+                &self.value_cache[layer_start..layer_end],
+                &dims,
+                pos,
+                &mut self.scores,
+            );
+
+            // Residual 1: the attention block's output joins the residual
+            // stream. This is an *addition*; replacing x with the attention
+            // output would discard everything the earlier layers computed and is
+            // mutant 9 in the mutation check.
+            ops::matmul(&mut self.xb, &self.att, w.wo_layer(l), d, q_dim);
+            for i in 0..d {
+                self.x[i] += self.xb[i];
+            }
+
+            // --- feed forward ----------------------------------------------
+            ops::rmsnorm(&mut self.xb, &self.x, w.rms_ffn_layer(l));
+
+            // SwiGLU: silu(w1 x) * (w3 x). `w1` is the "gate" and `w3` is the
+            // "up" projection; which one gets the nonlinearity is not
+            // symmetric, and swapping them is mutant 7.
+            ops::matmul(&mut self.hb, &self.xb, w.w1_layer(l), cfg.hidden_dim, d);
+            ops::matmul(&mut self.hb2, &self.xb, w.w3_layer(l), cfg.hidden_dim, d);
+            for i in 0..cfg.hidden_dim {
+                self.hb[i] = ops::silu_value(self.hb[i]) * self.hb2[i];
+            }
+
+            // Residual 2: the feed-forward block's output joins the stream.
+            ops::matmul(&mut self.xb, &self.hb, w.w2_layer(l), d, cfg.hidden_dim);
+            for i in 0..d {
+                self.x[i] += self.xb[i];
+            }
+        }
+
+        // --- head ----------------------------------------------------------
+        // Final norm, then project to vocabulary logits. The untied case uses
+        // wcls; the tied case reuses the token embedding, which is why a tied
+        // model has no separate output matrix.
+        ops::rmsnorm(&mut self.xb, &self.x, &w.rms_final);
+        ops::matmul(
+            &mut self.logits,
+            &self.xb,
+            w.classifier(),
+            cfg.vocab_size,
+            d,
+        );
+
+        Ok(&self.logits)
+    }
+}
+
+/// Index and value of the largest logit.
+///
+/// `best_val.is_nan()` in the condition is what makes this total on `NaN`
+/// input. A plain `v > best_val` would never be true for a `NaN`, so a `NaN`
+/// would simply be skipped and the argmax would be whatever the largest *finite*
+/// logit was. Checking the incumbent instead means the first `NaN` encountered
+/// wins and every subsequent element replaces it, which is arbitrary but
+/// deterministic. Greedy decoding has to return *something* even for a broken
+/// model, and "something deterministic" is worth more than "something finite".
+///
+/// It also never returns out of bounds: `best_idx` is only ever set together
+/// with a value read from the slice.
+pub fn argmax(logits: &[f32]) -> (usize, f32) {
+    let mut best_idx = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val || best_val.is_nan() {
+            best_idx = i;
+            best_val = v;
+        }
+    }
+    (best_idx, best_val)
+}
+
+/// Greedy-decode up to `n` tokens after `prompt`.
+///
+/// Greedy means always taking the argmax: no temperature, no top-k, no
+/// sampling. That is a deliberate limitation. Sampling needs an RNG, and an RNG
+/// would make the byte-identical comparison against llama2.c's `run.c`
+/// impossible unless both sides consumed the identical stream. Greedy decoding
+/// is a pure function of the weights and the prompt, so two implementations that
+/// agree on the maths produce *byte-identical* output - a far stronger claim
+/// than "the text looks about right".
+///
+/// # Forward-pass accounting
+///
+/// The prompt fills positions `0..prompt.len()`. The logits produced by the
+/// *last* prompt token are the ones that predict the first generated token, so
+/// that pass is not wasted. Each subsequent generated token needs exactly one
+/// more pass, and the loop below stops before issuing a pass whose output it
+/// would not use. Total passes: `prompt.len() + n - 1`.
+///
+/// Returns the generated tokens, excluding the prompt. Generation stops early
+/// if the model emits EOS, which is how a fine-tuned model signals the end of a
+/// document; a model that has not learned to emit EOS simply runs to `n`.
+pub fn generate(
+    w: &Weights,
+    state: &mut State,
+    prompt: &[u32],
+    n: usize,
+) -> Result<Vec<u32>, RunError> {
+    if prompt.is_empty() {
+        // An empty prompt has no last token to condition on, so there is
+        // nothing to continue from. Silently starting from BOS instead would
+        // hide a caller bug behind a plausible-looking result.
+        return Err(RunError::EmptyPrompt);
+    }
+    if prompt.len() + n > w.config.seq_len {
+        return Err(RunError::TooManyTokens {
+            requested: prompt.len() + n,
+            seq_len: w.config.seq_len,
+        });
+    }
+
+    // Consume the prompt. Only the final iteration's logits are used, and the
+    // argmax is taken immediately so the borrow on `state` ends before the
+    // generation loop begins.
+    let mut next = 0u32;
+    for (pos, &t) in prompt.iter().enumerate() {
+        let logits = state.forward(w, t, pos)?;
+        if pos + 1 == prompt.len() {
+            next = argmax(logits).0 as u32;
+        }
+    }
+
+    let mut generated: Vec<u32> = Vec::with_capacity(n);
+    // The next token to be emitted has not been forwarded yet; it will occupy
+    // position `prompt.len()`.
+    let mut pos = prompt.len();
+    while generated.len() < n {
+        if next == crate::tokenizer::EOS_ID {
+            break;
+        }
+        generated.push(next);
+        if generated.len() == n {
+            // Emitting the last requested token; a further forward pass would
+            // only compute logits nobody reads.
+            break;
+        }
+        let logits = state.forward(w, next, pos)?;
+        pos += 1;
+        next = argmax(logits).0 as u32;
+    }
+
+    Ok(generated)
 }
