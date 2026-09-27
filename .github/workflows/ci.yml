@@ -4,8 +4,10 @@
 # separate from the expensive differential ones, so a reviewer opening this file
 # can see at a glance what each guarantee rests on.
 #
-#   rust          fmt, clippy, unit/integration tests, and the zero-dependency
-#                 assertion. No Python, no network, runs in about a minute.
+#   rust          fmt, clippy, unit/integration tests, the zero-dependency
+#                 assertion, and a mutation sweep proving those tests can
+#                 fail. The slowest step is the sweep, which rebuilds the
+#                 crate 21 times.
 #   differential  the six-config comparison against PyTorch, then the mutation
 #                 check that proves the comparison can fail.
 #   real-weights  the same comparison against a genuinely trained
@@ -60,6 +62,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Python is only for the mutation sweep at the end of this job, but
+      # pinning the version is cheaper than relying on whatever the runner
+      # image happens to ship.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       # Asserted before anything else runs. If a dependency ever sneaks in, the
       # build should stop here rather than at the end of a long pipeline, and
       # the message should say exactly which packages appeared.
@@ -106,6 +115,22 @@ jobs:
 
       - name: Test (debug, overflow checks on)
         run: cargo test --locked
+
+      # The job that justifies the one above.
+      #
+      # `cargo test` passing says the suite agrees with the code. It does not
+      # say the suite can *notice* disagreement. This injects 21 realistic bugs
+      # one at a time and requires `cargo test` to fail on every one, which is
+      # the difference between "75 tests" and "75 tests that would catch 21
+      # known defects".
+      #
+      # It found two real holes when it was first run, and both are now fixed:
+      # the RoPE tests were all structural invariants satisfied by *any*
+      # frequencies, so `2 * i` -> `i` passed every one of them; and nothing
+      # covered generation's BOS termination, which is the bug the byte-identity
+      # check found by hand.
+      - name: Prove the test suite can fail
+        run: python reference/mutation_check_tests.py
 
   # ---------------------------------------------------------------------------
   differential:

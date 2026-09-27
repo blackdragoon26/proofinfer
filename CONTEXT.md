@@ -160,6 +160,38 @@ untied classifier ignored; residual `x += d` -> `x = d`; RoPE theta 10000 ->
 Required result: **10/10 caught**. If one survives, the suite has a blind spot
 and the suite is what gets fixed.
 
+The per-mutant output names *which configurations* caught each bug, and that is
+the part worth reading: `gqa-modulo-mapping` is caught by `gqa-2x` and `gqa-4x`
+and nothing else, because modulo and division agree when `kv_heads == n_heads`.
+`ignore-untied-classifier` is caught by `untied-cls` alone. If every mutant had
+been caught by all six, the suite would have had no discrimination and the
+number would have hidden that.
+
+### The same discipline applied to the Rust tests
+
+`reference/mutation_check.py` proves the *differential harness* can fail. It says
+nothing about whether `cargo test` can. `reference/mutation_check_tests.py`
+closes that: 21 realistic bugs injected into `src/`, each required to make
+`cargo test` fail. **21/21 caught**, and running it the first time found two
+real holes in the suite:
+
+- Every RoPE test was a *structural* invariant, and a structural invariant is
+  satisfied by any angle at all. `2 * i` -> `i` therefore passed all four. Fixed
+  by a test that computes the expected angle from the documented schedule.
+- Nothing covered generation stopping on BOS. The byte-identity check had found
+  that bug by hand and the differential harness cannot see it because it never
+  looks at text. Fixed with an engineered checkpoint plus its mirror.
+
+A third finding was a test passing for the wrong reason:
+`state_rejects_a_config_whose_cache_would_overflow` used `i32::MAX` as `dim`,
+which is odd, so `State::new` returned `InvalidHeader` for the odd head size and
+never reached the arithmetic the test is named after. "Assert some error" was
+not enough; it now asserts the specific `Overflow { what: "kv cache" }`.
+
+Lesson worth keeping: a suite that has only ever been seen passing is
+indistinguishable from a suite that cannot fail. Every check in this repository
+has now been exercised in a state where it had to go red.
+
 ## 8. Performance
 
 Measured on an Apple M3 (rustc 1.98.0, Apple clang 21.0.0), stories15M, 248

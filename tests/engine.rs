@@ -232,6 +232,149 @@ fn untied_and_tied_models_produce_different_logits() {
 }
 
 // ---------------------------------------------------------------------------
+// Termination
+// ---------------------------------------------------------------------------
+
+/// Build a checkpoint engineered so that the very first greedy step emits BOS.
+///
+/// Every weight matrix is zero, so each layer contributes nothing and the
+/// residual stream stays equal to the input token's embedding row. The final
+/// rmsnorm is all ones, and the classifier is tied to the embedding, so the
+/// logits are `embedding[v] . x_final` — the argmax is whichever embedding row
+/// has the largest first component. That is the knob: token 0's row gets 1.0 to
+/// drive the residual stream, BOS's row gets 2.0 to win the argmax, and every
+/// other row stays zero.
+fn bos_emitting_checkpoint() -> Weights {
+    const DIM: usize = 4;
+    const VOCAB: usize = 8;
+    const LAYERS: usize = 1;
+    const HEADS: usize = 2; // head_size 2, even
+    const SEQ: usize = 8;
+    const BOS: usize = 1;
+
+    let head_size = DIM / HEADS;
+    let kv_dim = head_size * HEADS;
+
+    // Walk the tensors in file order with a running cursor rather than writing
+    // out a hand-computed offset. The first version of this fixture did the
+    // arithmetic by hand, got it wrong, and the test failed for a reason that
+    // had nothing to do with what it was testing. A cursor cannot drift.
+    let mut f: Vec<f32> = Vec::new();
+    let take = |n: usize, f: &mut Vec<f32>| {
+        let at = f.len();
+        f.resize(at + n, 0.0);
+        at
+    };
+
+    let emb = take(VOCAB * DIM, &mut f);
+    take(LAYERS * DIM, &mut f); // rms_att
+    take(LAYERS * DIM * DIM, &mut f); // wq
+    take(LAYERS * kv_dim * DIM, &mut f); // wk
+    take(LAYERS * kv_dim * DIM, &mut f); // wv
+    take(LAYERS * DIM * DIM, &mut f); // wo
+    take(LAYERS * DIM, &mut f); // rms_ffn
+    take(LAYERS * DIM * DIM, &mut f); // w1 (hidden = dim)
+    take(LAYERS * DIM * DIM, &mut f); // w2
+    take(LAYERS * DIM * DIM, &mut f); // w3
+    let rms_final = take(DIM, &mut f);
+    take(2 * SEQ * (head_size / 2), &mut f); // freq_cis, both tables
+
+    for v in f[rms_final..rms_final + DIM].iter_mut() {
+        *v = 1.0;
+    }
+    // Control surface. Because `logits[v] = E[input] . E[v]`, the argmax is the
+    // vocabulary row most similar to the *input* row, so putting the control
+    // rows on different coordinates is what makes them independently
+    // reachable. Three rows on one axis would not work: the argmax over
+    // E[:, 0] depends only on the sign of x[0], so every positive input picks
+    // the same winner.
+    //
+    //   E[0]   = (1,0,0,0)  ->  argmax over E[:,0] is BOS  (2.0)     : terminates
+    //   E[BOS] = (2,0,0,0)
+    //   E[2]   = (0,1,0,0)  ->  argmax over E[:,1] is token 2 (1.0)   : loops
+    f[emb] = 1.0;
+    f[emb + BOS * DIM] = 2.0;
+    f[emb + 2 * DIM + 1] = 1.0;
+
+    let mut bytes = Vec::with_capacity(28 + f.len() * 4);
+    for field in [
+        DIM as i32,
+        DIM as i32, // hidden
+        LAYERS as i32,
+        HEADS as i32,
+        HEADS as i32, // kv_heads
+        VOCAB as i32,
+        SEQ as i32,
+    ] {
+        bytes.extend_from_slice(&field.to_le_bytes());
+    }
+    for v in &f {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    Weights::from_bytes(&bytes).expect("engineered checkpoint must load")
+}
+
+#[test]
+fn generate_stops_on_bos_because_bos_delimits_documents() {
+    // llama2.c's rule is `if (next == 1) break;` - BOS, not EOS - because BOS
+    // is the document delimiter these models are trained with. Stopping on EOS
+    // instead means never stopping on a BOS-delimited checkpoint: our text ran
+    // straight past the end of the first story and diverged from `run.c` by
+    // 112 bytes.
+    //
+    // The byte-identity check in reference/bench.py is what caught that, and the
+    // differential harness cannot see it at all because it never looks at text.
+    // A mutation sweep over this file found the same hole, so the rule is
+    // pinned here too.
+    let w = bos_emitting_checkpoint();
+    let prompt = vec![0u32];
+
+    // Sanity: the fixture really does predict BOS after token 0. Without this
+    // the test could pass for the wrong reason, e.g. if `generate` always
+    // returned nothing.
+    let mut probe = State::new(&w.config).unwrap();
+    let logits = probe.forward(&w, 0, 0).unwrap();
+    assert_eq!(
+        argmax(logits).0 as u32,
+        tinyinfer::tokenizer::BOS_ID,
+        "fixture is wrong: the first step must predict BOS"
+    );
+
+    let gen = generate(&w, &mut State::new(&w.config).unwrap(), &prompt, 5).unwrap();
+    assert!(
+        gen.is_empty(),
+        "generation must stop immediately on BOS, got {gen:?}"
+    );
+}
+
+#[test]
+fn generate_keeps_going_when_the_next_token_is_not_bos() {
+    // The mirror of the test above, so the first one cannot pass for the wrong
+    // reason. Feeding token 2 makes token 2 the argmax, which is not a
+    // terminator, so all five requested tokens are produced.
+    let w = bos_emitting_checkpoint();
+
+    let mut probe = State::new(&w.config).unwrap();
+    let logits = probe.forward(&w, 2, 0).unwrap();
+    assert_ne!(
+        argmax(logits).0 as u32,
+        tinyinfer::tokenizer::BOS_ID,
+        "fixture is wrong: token 2 must not be a terminator"
+    );
+
+    let gen = generate(&w, &mut State::new(&w.config).unwrap(), &[2], 5).unwrap();
+    assert_eq!(
+        gen.len(),
+        5,
+        "nothing terminates, so all 5 tokens are produced"
+    );
+    assert!(
+        gen.iter().all(|&t| t == 2),
+        "expected a fixed point on token 2, got {gen:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // argmax
 // ---------------------------------------------------------------------------
 
@@ -349,9 +492,14 @@ fn state_scratch_matches_the_config() {
 
 #[test]
 fn state_rejects_a_config_whose_cache_would_overflow() {
-    // Structurally legal, but the cache size product is unrepresentable.
+    // Structurally legal, and legal in the way that matters: `head_size` must
+    // be *even* so the config gets past `AttentionDims::try_new` and actually
+    // reaches the cache arithmetic. The first version of this test used
+    // `i32::MAX`, which is odd, so `State::new` rejected the odd head size and
+    // returned `InvalidHeader` - the test passed without ever exercising the
+    // overflow it is named after. A mutation sweep caught that.
     let cfg = Config {
-        dim: i32::MAX as usize,
+        dim: i32::MAX as usize - 1, // even, so head_size is even
         hidden_dim: 1,
         n_layers: i32::MAX as usize,
         n_heads: 1,
@@ -359,5 +507,21 @@ fn state_rejects_a_config_whose_cache_would_overflow() {
         vocab_size: 1,
         seq_len: i32::MAX as usize,
     };
-    assert!(State::new(&cfg).is_err());
+    // Sanity: the shape really is acceptable, so the only thing left that can
+    // fail is the arithmetic.
+    assert!(
+        cfg.attention_dims().is_ok(),
+        "fixture is wrong: the config must be structurally valid"
+    );
+
+    // Assert the *specific* error, not just that there is one. Otherwise a
+    // future change that rejects this config for an unrelated reason would
+    // keep the test green while the overflow path went untested.
+    match State::new(&cfg) {
+        Err(tinyinfer::model::LoadError::Overflow { what }) => {
+            assert_eq!(what, "kv cache");
+        }
+        Err(other) => panic!("expected an overflow error, got {other:?}"),
+        Ok(_) => panic!("an unrepresentable cache must not be accepted"),
+    }
 }

@@ -652,6 +652,52 @@ mod tests {
         assert_close(dot(&a, &b), dot(&b, &a), 1e-6);
     }
 
+    /// The RoPE *frequency schedule* is pinned here, which none of the
+    /// structural RoPE tests above can do.
+    ///
+    /// Every other rope test checks an invariant that holds for *any* choice of
+    /// frequencies: the identity at pos 0, pair-norm preservation, no head
+    /// mixing, and the relative-position property are all satisfied by a
+    /// rotation through any angle at all. A mutation of the exponent from
+    /// `2 * i` to `i` produces angles that are wrong everywhere and still passes
+    /// all four. That was not a hypothetical: a mutation sweep over this file
+    /// found exactly that hole, and it is the same `2 * i -> i` bug the
+    /// differential harness catches, so the two suites were covering it between
+    /// them and the unit suite on its own was not.
+    ///
+    /// So: compute the expected angle here from the documented schedule,
+    /// independently of the implementation, and compare.
+    #[test]
+    fn rope_uses_the_documented_frequency_schedule() {
+        let head_size = 8usize;
+        let n_heads = 1usize;
+        let pos = 3usize;
+
+        for i in 0..head_size / 2 {
+            // A vector that is zero everywhere except at pair `i`, so the
+            // rotation is observable only through the angle for that pair.
+            let mut v = vec![0.0f32; head_size];
+            v[2 * i] = 1.0;
+            rope(&mut v, n_heads, head_size, pos);
+
+            // theta^(-2i/head_size), stated here rather than reusing the
+            // implementation's expression, so the exponent and the base are
+            // both pinned. The negation is done in f32 because `2 * i` is a
+            // usize and cannot be negated.
+            let exponent = -(2.0 * i as f32) / head_size as f32;
+            let expected = pos as f32 * ROPE_THETA.powf(exponent);
+            let (s, c) = expected.sin_cos();
+            assert_close(v[2 * i], c, 1e-6);
+            assert_close(v[2 * i + 1], s, 1e-6);
+        }
+
+        // Pin the base directly as well. The loop above already fails for a
+        // wrong theta, because every i > 0 angle scales with it; this makes the
+        // constant itself an asserted part of the architecture rather than a
+        // value the tests happen to be consistent with.
+        assert_eq!(ROPE_THETA, 10000.0);
+    }
+
     #[test]
     fn dot_handles_every_length_across_the_lane_boundary() {
         // The eight-lane reduction has a main loop and a remainder, and the
