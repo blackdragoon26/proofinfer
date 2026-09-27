@@ -228,6 +228,8 @@ Everything above those is tested; those are assumed and stated.
    discharged by Verus under `--no-cheating`. What it does *not* do is verify
    the crate. It is a model of the indexing arithmetic whose correspondence to
    `src/ops.rs` and `src/model.rs` is a human transcription, and a refactor
-   would leave it verifying a description of code that no longer exists. The
-   proof file says so in its own caveats, which is the point.
+   would leave it verifying a description of code that no longer exists. That
+   edge is now partly blunted: `verus/check_citations.py` checks, in CI, that
+   every source line the proof cites still holds the construct it is cited for,
+   and it is negative-tested against exactly the edits it is meant to catch.
 8. What is in the TCB?

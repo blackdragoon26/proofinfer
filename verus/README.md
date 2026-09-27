@@ -124,10 +124,16 @@ claiming otherwise.**
    If someone changed the loader's checks, or changed an index expression in
    `src/ops.rs`, **this file would keep verifying.** It would simply be
    describing the old code. This is the single most important caveat: the proof
-   is a proof *about a transcription*, and a re-check after any edit to
-   `src/ops.rs` or `src/model.rs` is a human obligation. The line-number table
-   in section 2 is the only thing that would flag such a drift, and it flags it
-   by eye, not by machine.
+   is a proof *about a transcription*.
+
+   The link is now partly machine-checked. `verus/check_citations.py` verifies
+   that every source line cited in this file and in `kv_cache_bounds.rs` still
+   contains the construct it is cited for, and CI runs it before Verus. So
+   changing `h / kv_mul`, or refactoring in a way that shifts the line numbers,
+   turns the build red instead of leaving a stale claim. What that check does
+   *not* do is verify the reasoning: an edit that preserves a cited
+   expression's text but changes what it computes elsewhere, or a gap in which
+   expressions were transcribed at all, would still pass.
 3. **The loader's `checked_mul` is assumed, not proved.** The overflow
    preconditions in the `exec fn`s (`head_size * n_kv_heads <= usize::MAX`,
    `(n_layers * seq_len) * (head_size * n_kv_heads) <= usize::MAX`,

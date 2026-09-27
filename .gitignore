@@ -28,6 +28,12 @@ __pycache__/
 venv/
 .pytest_cache/
 
+# Verus, if you reproduce the proof check locally rather than in CI. The
+# prebuilt release is ~485 MB and is not a project artifact; the verified
+# download and how to run it are in verus/README.md.
+verus-dist/
+verus.zip
+
 # The differential harness downloads this from Hugging Face on demand.
 stories15M.pt
 

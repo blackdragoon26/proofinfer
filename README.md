@@ -260,7 +260,9 @@ tinyinfer/
     llama2c/                 vendored UNMODIFIED from karpathy/llama2.c (MIT)
   verus/                     Verus proof of KV-cache index safety (24 conditions,
                              machine-checked; see its README for the scope)
-  .github/workflows/ci.yml   three jobs, no `|| true`, no continue-on-error
+                             plus check_citations.py, which keeps the proof
+                             from silently drifting away from src/
+  .github/workflows/ci.yml   four jobs, no `|| true`, no continue-on-error
 ```
 
 ## Quick start
@@ -385,24 +387,56 @@ arithmetic cannot overflow `usize`. The real slice expressions are transcribed
 into `exec fn`s operating on actual `Vec<f32>`, so Verus discharges genuine
 slice-indexing obligations rather than assertions about symbolic expressions.
 
-What is **not** proved, and `verus/README.md` lists eleven items of which these
-are the two that matter most:
+### Keeping the proof honest
+
+A green Verus run is not enough on its own, because the proof verifies a
+*model*. If someone changed `h / kv_mul` in `ops.rs`, the proof would keep
+verifying, faithfully, about code that no longer exists — and the green tick
+would be actively misleading.
+
+So `verus/check_citations.py` checks the link. Every source line the proof and
+its README cite must still contain the construct it is cited for. It is
+bidirectional — an uncited citation and an unused expectation are both failures,
+so neither the prose nor the table can quietly stop being checked. Stdlib only,
+so it costs nothing in CI.
+
+The check has been negative-tested, which matters more than it passing: it goes
+red when the GQA mapping is mutated in place, when an unrelated edit shifts the
+line numbers, when the attention window changes, and when a cache write is
+deleted from `forward`.
+
+What it still does not check is the reasoning. An edit that preserves a cited
+expression's text while changing what it computes elsewhere would pass, as would
+a gap in which expressions were transcribed at all. It is a tripwire on the
+likely accident, not a proof of correspondence.
+
+### What is **not** proved
+
+`verus/README.md` lists eleven items; these are the two that matter most:
 
 1. **It is a proof about a transcription, not about the crate.** `src/ops.rs`
    and `src/model.rs` contain no `verus!` macro and are not compiled by Verus.
-   If someone changed an index expression, this file would keep verifying and
-   would simply be describing the old code. The line-number table in
-   `verus/README.md` is the only thing that would flag such a drift, and it
-   flags it by eye, not by machine. (I re-derived all 31 of those citations
-   against the current commit when reviewing it.)
+   The citation check above narrows how far this can go wrong; it does not
+   close it.
 2. **Bounds safety does not catch wrong-but-in-bounds bugs.** Mutant #3
    (`h / kv_mul` -> `h % n_kv_heads`) is also in range and sails straight
    through. That is the boundary between what a verifier can say and what only
    the differential test can say, and the proof file says so itself.
 
-Verus is not a dependency of this crate and is not vendored — it is a 449 MB
-prebuilt release, and it is **not** part of CI. Reproducing the check is a
-manual three-step command in `verus/README.md`.
+### Running the proof
+
+The `proof` CI job fetches the prebuilt Verus release, verifies it against the
+sha256 GitHub publishes for that asset, installs the toolchain Verus asks for
+(it prints the exact `rustup install` line, which the job parses rather than
+hardcoding a version), and runs the verifier. Verus is not a dependency of
+this crate and is not vendored.
+
+**One caveat, stated plainly:** that job's logic was dry-run locally and passes
+all four steps, but the Verus *run* was verified on macOS/arm64. The Linux
+x86-64 download and execution are the one part of this repository that has not
+been executed, because this machine is not a GitHub runner. If that job goes red
+on the first run, the citation check and the other three jobs are unaffected,
+and the log will name the step.
 
 Nothing else here is machine-checked. The loader's totality rests on 2000 fuzz
 iterations plus reasoning, not a proof; the differential test establishes

@@ -11,6 +11,9 @@
 #   real-weights  the same comparison against a genuinely trained
 #                 stories15M checkpoint, on a 200-token sequence chosen by the
 #                 reference decoder.
+#   proof         the Verus development in verus/, plus a check that it still
+#                 describes the code it claims to describe. Added after the
+#                 proof landed; the other three are unchanged.
 #
 # There is no `continue-on-error` and no `|| true` anywhere in this file, and
 # there will not be. A test that cannot fail is worse than no test, because it
@@ -34,7 +37,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # One place to change the toolchain, so all three jobs agree.
+  # One place to change the toolchain, so the three Rust jobs agree. The `proof`
+  # job deliberately does not use this: Verus is built against one specific
+  # rustc, prints the exact `rustup install` line for it when it is missing, and
+  # installs that instead. Pinning RUSTUP_TOOLCHAIN here would hand Verus a
+  # toolchain it cannot use.
   RUST_TOOLCHAIN: stable
 
 jobs:
@@ -193,3 +200,102 @@ jobs:
       # proves the arithmetic; this proves the engine runs real weights.
       - name: Differential test on real weights
         run: python reference/diff_test.py --checkpoint stories15M.pt -n 200
+
+  # ---------------------------------------------------------------------------
+  proof:
+    name: proof (Verus + citation drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The cheapest and most important step in this job.
+      #
+      # `verus/kv_cache_bounds.rs` is a *model* of the indexing arithmetic;
+      # `src/ops.rs` and `src/model.rs` contain no `verus!` macro and are never
+      # compiled by Verus. So a green Verus run does not by itself prove the
+      # proof still matches the code. This check closes that gap for the likely
+      # failure mode: it verifies that every source line the proof cites still
+      # contains the construct it is cited for. Change `h / kv_mul` to anything
+      # else, or refactor and shift the line numbers, and this goes red.
+      - name: Check the proof still describes the current source
+        run: python verus/check_citations.py
+
+      # 485 MB, so it is cached rather than re-fetched on every push. The key
+      # includes the Verus version, so bumping Verus busts the cache.
+      - name: Cache the Verus release
+        id: verus-cache
+        uses: actions/cache@v4
+        with:
+          path: verus-dist
+          key: >-
+            verus-0.2026.09.20.aef82ed-x86-linux
+            -7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33
+
+      - name: Fetch and unpack Verus
+        if: steps.verus-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 3 --retry-delay 5 -o verus.zip \
+            'https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip'
+          # Pinned to the digest GitHub publishes for this asset, so the 485 MB
+          # download is verified rather than trusted. `sha256sum` rather than
+          # `shasum` because the runner is ubuntu and sha256sum is the one
+          # guaranteed by coreutils there.
+          echo '7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus.zip' \
+            | sha256sum --check --strict -
+          mkdir -p verus-dist
+          unzip -q verus.zip -d verus-dist
+
+      - name: Locate the Verus binary
+        # The archive's internal directory name is not part of its contract, so
+        # find the binary rather than hardcoding a path that a release could
+        # rename out from under us.
+        id: verus-bin
+        run: |
+          set -euo pipefail
+          bin=$(find verus-dist -type f -name verus -perm -u+x | head -1)
+          if [ -z "$bin" ]; then
+            echo "::error::no executable named 'verus' inside the archive"
+            find verus-dist -maxdepth 2 | head -20
+            exit 1
+          fi
+          echo "Found Verus at $bin"
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Install the toolchain Verus requires
+        run: |
+          set -euo pipefail
+          bin=${{ steps.verus-bin.outputs.path }}
+          # Verus exits non-zero and prints the exact `rustup install` line for
+          # the toolchain it was built against. Parse that rather than
+          # hardcoding a version, so a Verus bump cannot silently leave CI
+          # running against the wrong toolchain - or, worse, skipping the proof.
+          #
+          # The ANSI colour codes are stripped first. They are not cosmetic
+          # here: Verus indents the `rustup install` line and wraps the command
+          # in an escape sequence, so a `sed` anchored at the start of the line
+          # after whitespace matches nothing and the step would fail with
+          # "could not determine which toolchain Verus requires". Verified
+          # against real output rather than assumed.
+          clean=$("$bin" --version 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+          need=$(printf '%s\n' "$clean" \
+            | sed -n 's/^[[:space:]]*rustup install \([^[:space:]]*\).*$/\1/p' | head -1)
+          if [ -z "$need" ]; then
+            echo "::error::could not determine which toolchain Verus requires"
+            printf '%s\n' "$clean"
+            exit 1
+          fi
+          echo "Verus requires: $need"
+          rustup toolchain install "$need"
+
+      # --no-cheating rejects assume, admit and external_body, so "24 verified,
+      # 0 errors" is a claim about the file rather than a comment in it.
+      - name: Verify the KV-cache index-safety proof
+        run: |
+          set -euo pipefail
+          ${{ steps.verus-bin.outputs.path }} \
+            --crate-type lib --no-cheating verus/kv_cache_bounds.rs
