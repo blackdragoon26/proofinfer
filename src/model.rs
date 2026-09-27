@@ -813,9 +813,21 @@ pub fn argmax(logits: &[f32]) -> (usize, f32) {
 /// more pass, and the loop below stops before issuing a pass whose output it
 /// would not use. Total passes: `prompt.len() + n - 1`.
 ///
-/// Returns the generated tokens, excluding the prompt. Generation stops early
-/// if the model emits EOS, which is how a fine-tuned model signals the end of a
-/// document; a model that has not learned to emit EOS simply runs to `n`.
+/// Returns the generated tokens, excluding the prompt.
+///
+/// # Termination
+///
+/// Generation stops when the model emits **BOS**, not EOS. That is
+/// llama2.c's rule (`if (next == 1) break;`) and it is the rule the models were
+/// trained with: BOS is the document delimiter, so a model that has finished a
+/// document emits BOS to start the next one, and that is the natural place to
+/// stop. A model trained to emit EOS instead will simply run to `n`, which is a
+/// harmless loss of throughput rather than a wrong answer.
+///
+/// This is the kind of detail that only shows up when you diff against the
+/// reference: with a BOS-terminated checkpoint, stopping on EOS means never
+/// stopping, and the generated text diverges from `run.c` at exactly the
+/// position where the first document ended.
 pub fn generate(
     w: &Weights,
     state: &mut State,
@@ -851,7 +863,7 @@ pub fn generate(
     // position `prompt.len()`.
     let mut pos = prompt.len();
     while generated.len() < n {
-        if next == crate::tokenizer::EOS_ID {
+        if next == crate::tokenizer::BOS_ID {
             break;
         }
         generated.push(next);

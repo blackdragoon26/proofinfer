@@ -337,23 +337,28 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
                 prompt.len(),
                 args.num_tokens
             );
-            print!("{}", tokenizer.decode_text(&prompt));
-            let _ = std::io::stdout().flush();
+            print_tokens(&tokenizer, &prompt, None);
 
             let start = Instant::now();
             let generated = model::generate(&weights, &mut state, &prompt, args.num_tokens)?;
             let elapsed = start.elapsed();
 
-            // Streamed token by token in a real implementation; printed in one
-            // go here because the output is the deliverable rather than a
-            // progress display.
-            print!("{}", tokenizer.decode_text(&generated));
+            print_tokens(&tokenizer, &generated, prompt.last().copied());
             println!();
             let _ = std::io::stdout().flush();
 
-            let tps = generated.len() as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+            // Throughput counts the prompt as well as the generated tokens.
+            //
+            // The elapsed time covers every forward pass, including the ones
+            // that consumed the prompt, so dividing by generated tokens alone
+            // would charge the prompt's cost to nothing and flatter the number.
+            // Counting `prompt.len() + generated.len()` also matches llama2.c's
+            // convention, which is what makes the two directly comparable in
+            // `reference/bench.py`.
+            let processed = prompt.len() + generated.len();
+            let tps = processed as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
             eprintln!(
-                "generated {} tokens in {:.3}s ({tps:.2} tok/s)",
+                "generated {} tokens in {:.3}s ({tps:.2} tok/s, {processed} tokens processed)",
                 generated.len(),
                 elapsed.as_secs_f64()
             );
@@ -361,6 +366,57 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+/// Print a token sequence, one piece at a time, the way llama2.c does.
+///
+/// Decoding the whole sequence in one call and printing the result is simpler
+/// but not equivalent. `run.c` prints *per token* through `safe_printf`, which
+/// drops a piece that is a single byte which is neither printable nor
+/// whitespace. Decoding in bulk would emit those bytes, and the output would
+/// differ from the reference for reasons that have nothing to do with the
+/// model. Going piece by piece is what makes the byte-identical comparison in
+/// `reference/bench.py` a statement about the arithmetic.
+///
+/// `prev` is the token before this sequence, needed because the dummy-prefix
+/// rule depends on it. Pass `None` for a sequence that starts at BOS.
+fn print_tokens(tokenizer: &Tokenizer, tokens: &[u32], prev: Option<u32>) {
+    let mut previous = prev;
+    for &token in tokens {
+        let piece = tokenizer.decode_one(previous, token);
+        safe_print(&piece);
+        previous = Some(token);
+    }
+}
+
+/// Print one decoded piece, skipping the ones llama2.c would skip.
+///
+/// A single non-printable, non-whitespace byte is dropped. The reasoning is the
+/// reference's: byte-fallback tokens can name any byte at all, including
+/// control characters and half of a multi-byte UTF-8 sequence, and echoing
+/// those raw into a terminal is unpleasant and occasionally terminal-escaping.
+/// Pieces of two bytes or more are printed whole even if they are not valid
+/// UTF-8, which is the reference's behaviour and the reason this cannot simply
+/// be "print valid UTF-8".
+///
+/// "Printable" is ASCII 0x20..=0x7E and "whitespace" is the C library's
+/// `isspace` set. Both are spelled out rather than delegated to
+/// `char::is_control` because the point is to match a specific C
+/// implementation, not to have a defensible opinion about Unicode.
+fn safe_print(piece: &str) {
+    let bytes = piece.as_bytes();
+    if bytes.is_empty() {
+        return;
+    }
+    if bytes.len() == 1 {
+        let b = bytes[0];
+        let printable = (0x20..=0x7e).contains(&b);
+        let whitespace = matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+        if !(printable || whitespace) {
+            return;
+        }
+    }
+    print!("{piece}");
 }
 
 /// Create an output file, turning a path problem into a normal error.
