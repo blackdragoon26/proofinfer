@@ -162,13 +162,43 @@ and the suite is what gets fixed.
 
 ## 8. Performance
 
-Reported honestly, on whatever machine produced the numbers. The headline
-optimisation is the dot product: a serial `sum` chain is a loop-carried
-dependency that LLVM *cannot* vectorise, because floating-point addition is not
-associative and reassociating it would change the answer. Eight independent
-accumulators give it the freedom, and it does vectorise. That is worth roughly
-1.9x here. It also changes the last bits of the result, which is precisely why
-the comparison has to be tolerance-based rather than bitwise.
+Measured on an Apple M3 (rustc 1.98.0, Apple clang 21.0.0), stories15M, 248
+generated greedy tokens, 5 runs, median, single threaded. Full table and the
+reasoning are in the README; the two findings worth keeping here are:
+
+**The eight-accumulator dot product is necessary but not sufficient.** It is
+necessary because f32 addition is not associative, so LLVM may not split a
+serial `sum()` into parallel partial sums, and the resulting loop-carried
+dependency caps throughput at one add per multiply. It is *not* sufficient
+because writing the eight lanes as an indexed inner loop
+(`acc[lane] += a[i+lane] * b[i+lane]`) leaves eight independent **scalar**
+chains: 1.5 → 3.3 Gelem/s, which reads like success and is a third of the
+available win. Rewriting the identical arithmetic as `chunks_exact(8)` gets
+14.6 Gelem/s, because it hands the SLP pass one contiguous chunk to pack. 153 →
+208 → 816 tok/s across the three variants. "Use eight accumulators" is advice
+that gets you most of the way and looks like it got all of it.
+
+**`run.c -Ofast` is still 1.2x faster** (978 vs 816 tok/s), because
+`-ffast-math` lets clang reassociate anywhere, not just in one dot product.
+This is reported rather than hidden. Part of that gap is reachable by writing
+the loop in a shape the compiler likes; the rest is not, and the cost of not
+taking it is a smaller trusted surface for the numerics.
+
+Two bugs were found only by the byte-identical comparison against `run.c`,
+neither reachable from the differential test (which never looks at text):
+
+- Generation stopped on **EOS**; `run.c` stops on **BOS**, which is the
+  document delimiter these models are trained with. On stories15M our output
+  ran past the end of the first story and the texts diverged by 112 bytes.
+- Output was decoded and printed in one call. `run.c` prints *per token*
+  through `safe_printf`, which drops single non-printable bytes. Bulk decoding
+  emits them, so the byte comparison needs `print_tokens` + `safe_print`.
+
+`bench.py` also has to give `run.c` a larger step budget than we use:
+`run.c`'s `-n` counts total forward passes from position 0, prompt included,
+while ours counts generated tokens only. Comparing equal numbers made one side
+stop early, and the outputs then differed by length for a reason that had
+nothing to do with the arithmetic.
 
 ## 9. Trusted computing base
 

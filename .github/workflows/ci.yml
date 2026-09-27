@@ -1,0 +1,195 @@
+# CI for tinyinfer.
+#
+# Three jobs, and the split is the point: the cheap correctness checks are
+# separate from the expensive differential ones, so a reviewer opening this file
+# can see at a glance what each guarantee rests on.
+#
+#   rust          fmt, clippy, unit/integration tests, and the zero-dependency
+#                 assertion. No Python, no network, runs in about a minute.
+#   differential  the six-config comparison against PyTorch, then the mutation
+#                 check that proves the comparison can fail.
+#   real-weights  the same comparison against a genuinely trained
+#                 stories15M checkpoint, on a 200-token sequence chosen by the
+#                 reference decoder.
+#
+# There is no `continue-on-error` and no `|| true` anywhere in this file, and
+# there will not be. A test that cannot fail is worse than no test, because it
+# is a claim of confidence with nothing behind it. If a job here goes red, the
+# correct response is to find the bug, not to soften the check.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref. This does not make anything pass
+# conditionally; it only avoids spending runner minutes on commits that have
+# already been superseded.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # One place to change the toolchain, so all three jobs agree.
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  # ---------------------------------------------------------------------------
+  rust:
+    name: rust (fmt, clippy, tests, zero deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Asserted before anything else runs. If a dependency ever sneaks in, the
+      # build should stop here rather than at the end of a long pipeline, and
+      # the message should say exactly which packages appeared.
+      #
+      # The count is taken with awk rather than `grep -c ... || true`. grep
+      # exits 1 when it finds nothing, which is the *expected* result for an
+      # empty file, and the usual ways of papering over that are exactly the
+      # `|| true` this repository forbids. awk exits 0 either way, so no
+      # escape hatch is needed.
+      - name: Assert zero external dependencies
+        run: |
+          set -euo pipefail
+          count=$(awk '/^\[\[package\]\]/{n++} END{print n+0}' Cargo.lock)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Cargo.lock must contain exactly one package, found ${count}"
+            awk '/^\[\[package\]\]/{getline n; print n}' Cargo.lock
+            exit 1
+          fi
+          if ! grep -q '^name = "tinyinfer"$' Cargo.lock; then
+            echo "::error::the only package in Cargo.lock must be tinyinfer itself"
+            cat Cargo.lock
+            exit 1
+          fi
+          echo "Cargo.lock contains exactly one package: tinyinfer"
+
+      # --locked fails if Cargo.lock is out of date with Cargo.toml, which is
+      # what stops a dependency change from being quietly committed without the
+      # lock file.
+      - name: Build (locked)
+        run: cargo build --release --locked
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --release -- -D warnings
+
+      # Both profiles on purpose. Debug enables integer overflow checks, and
+      # the loader's checked_mul arithmetic is exactly where a wrapping
+      # computation would hide. A test that only ever runs in release never
+      # sees that.
+      - name: Test (release)
+        run: cargo test --release --locked
+
+      - name: Test (debug, overflow checks on)
+        run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  differential:
+    name: differential (vs PyTorch) + mutation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # CPU-only torch. The CUDA wheel is several gigabytes and this job never
+      # touches a GPU, so the CPU index is both faster and more honest about
+      # what is being tested.
+      - name: Install numpy and CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy torch \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # Six configurations: MHA, two levels of GQA, MQA, an untied classifier,
+      # and a 128-token context. Each is exported with the reference's own
+      # legacy_export, run through PyTorch, and run through the engine.
+      - name: Differential test
+        run: python reference/diff_test.py
+
+      # Injects ten realistic bugs and requires the harness above to fail on
+      # every one. This is what makes the previous step mean something: a
+      # comparison that has never failed is equally consistent with "correct"
+      # and with "cannot detect anything".
+      - name: Mutation check
+        run: python reference/mutation_check.py
+
+  # ---------------------------------------------------------------------------
+  real-weights:
+    name: real weights (stories15M)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install numpy and CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy torch \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
+
+      # 60 MB, so it is cached rather than re-fetched. The key includes the
+      # URL, which means a different checkpoint busts the cache automatically.
+      - name: Cache stories15M.pt
+        id: stories-cache
+        uses: actions/cache@v4
+        with:
+          path: stories15M.pt
+          key: stories15M-https-huggingface-co-karpathy-tinyllamas-resolve-main-stories15M-pt
+
+      - name: Download stories15M.pt
+        if: steps.stories-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 3 --retry-delay 5 -o stories15M.pt \
+            https://huggingface.co/karpathy/tinyllamas/resolve/main/stories15M.pt
+
+      - name: Build
+        run: cargo build --release --locked
+
+      # A genuinely trained 15M-parameter Llama, with real weight distributions
+      # and a 32000-entry vocabulary, on a 200-token sequence chosen by the
+      # reference greedy decoder rather than by us. The random-weight suite
+      # proves the arithmetic; this proves the engine runs real weights.
+      - name: Differential test on real weights
+        run: python reference/diff_test.py --checkpoint stories15M.pt -n 200

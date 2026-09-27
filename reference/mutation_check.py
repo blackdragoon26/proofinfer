@@ -264,8 +264,11 @@ def check_mutant(
                 time.time() - started,
             )
 
-        # Report which configurations noticed, because "it failed" is much less
-        # informative than "the GQA configs noticed and nothing else did".
+        # Report exactly which configurations noticed. "it failed" is much less
+        # informative than "the GQA configs noticed and nothing else did", and
+        # the *absence* of a configuration from this list is the interesting
+        # part: it says which bugs that configuration is blind to. So the list
+        # is complete rather than truncated, and the README quotes it verbatim.
         failed_lines = [
             line.strip()
             for line in diff.stdout.splitlines()
@@ -273,7 +276,9 @@ def check_mutant(
         ]
         detail = "caught"
         if failed_lines:
-            detail += " by " + "; ".join(f.split()[0] for f in failed_lines[:4])
+            detail += " by " + ", ".join(f.split()[0] for f in failed_lines)
+        else:
+            detail += " (harness failed without naming a configuration)"
         return Outcome(m.name, True, detail, time.time() - started)
     finally:
         path.write_text(original)
