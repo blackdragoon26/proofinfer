@@ -1,5 +1,7 @@
 # proofinfer — landing page
 
+**Live at <https://proofinfer.vercel.app>.**
+
 The site for this project, living in the repository at `site/`. Four pages, one
 stylesheet, one small script. No framework, no build step, no dependencies. Open
 it directly or serve the folder; it works either way.
@@ -46,17 +48,18 @@ To add a doc, add it to `PAGES` in `sync.py` and to `NAV`.
 
 ## Publishing
 
-The site is static, so anything that serves files will do. The docs are in this
-repository, so `site/` is the publish directory.
+**Live at <https://proofinfer.vercel.app>.**
 
-**GitHub Pages** — Settings -> Pages -> Deploy from a branch, `main` / `/site`.
-No build step; Jekyll will pass the files through, and none of them begin with
-an underscore so none will be excluded.
+The Vercel project is `proofinfer` (scope `sankalp-jhas-projects`), with its root
+directory set to `site` and no build step. It is connected to this repository
+through Vercel Git Integration, so a push to `main` deploys it:
 
-**Netlify / Vercel / Cloudflare Pages** — point them at the repository and set
-the publish directory to `site`. No build command.
+```txt
+git push origin main  ->  GitHub  ->  Vercel production deploy
+```
 
-**Plain host** — copy `site/` to the web root. It is self-contained.
+The root directory matters: without it Vercel would serve the repository root and
+publish `src/`, `Cargo.toml` and the rest of the engine alongside the site.
 
 `sync.py` reads the docs from `..`, so it works from a plain checkout with no
 arguments. That path matters only when regenerating; the committed HTML does not
