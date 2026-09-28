@@ -200,11 +200,21 @@ Apple M3, macOS 26.4.1, rustc 1.98.0, Apple clang 21.0.0. Single threaded.
 stories15M (dim 288, 6 layers, 6 heads, vocab 32000, context 256), 248
 generated greedy tokens, 5 runs, median.
 
-Every row was measured in a single session with the same `run.c` binaries, so
-no row is quoted from a run with different machine load than the others. Run to
-run spread on this machine is a few percent, and the first run after a rebuild
-is reliably ~12% slow (page faults on the 60 MB checkpoint), so the medians are
-quoted and the digits are not meaningful.
+Every row was measured in a single session on an **otherwise idle** machine,
+with the same `run.c` binaries, so no row is quoted from a run with different
+load than the others.
+
+**These absolute numbers are not reproducible on a busy machine, and the table
+should be read with that in mind.** Measured later on the same machine while a
+load average of ~5.7 was running (browser, compilers, terminal), the same
+7-run measurement gave 619 tok/s with individual runs spanning **431 to 674** —
+a 56% spread, not the few percent an idle machine shows. The first run after a
+rebuild is also reliably ~12% slow, from page faults on the 60 MB checkpoint.
+
+So: quote these figures as "what this engine did on an idle M3", and use them
+for ratios rather than absolutes. What *is* reproducible under any load is the
+byte-identity result below, because that is a correctness claim rather than a
+timing one.
 
 | engine | tok/s |
 |---|---|
