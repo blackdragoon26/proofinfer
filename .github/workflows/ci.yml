@@ -295,23 +295,31 @@ jobs:
         run: |
           set -euo pipefail
           bin=${{ steps.verus-bin.outputs.path }}
-          # Verus exits non-zero and prints the exact `rustup install` line for
-          # the toolchain it was built against. Parse that rather than
-          # hardcoding a version, so a Verus bump cannot silently leave CI
-          # running against the wrong toolchain - or, worse, skipping the proof.
+          # Verus exits non-zero when its toolchain is not installed, and that
+          # error message is exactly what this step exists to read. Under
+          # `set -e` that *expected* non-zero status aborts the step before the
+          # message is ever parsed, so errexit is disabled for the one command
+          # and restored immediately afterwards.
           #
-          # The ANSI colour codes are stripped first. They are not cosmetic
-          # here: Verus indents the `rustup install` line and wraps the command
-          # in an escape sequence, so a `sed` anchored at the start of the line
+          # This is deliberately not `|| true`. The status is captured and
+          # printed, and the step still fails if the message turns out to be
+          # unparseable - which is the thing worth failing on.
+          set +e
+          raw=$("$bin" --version 2>&1)
+          verus_status=$?
+          set -e
+          echo "verus --version exited $verus_status (non-zero is expected here)"
+          # The ANSI colour codes are stripped first. They are not cosmetic:
+          # Verus indents the `rustup install` line and wraps the command in
+          # an escape sequence, so a `sed` anchored at the start of the line
           # after whitespace matches nothing and the step would fail with
-          # "could not determine which toolchain Verus requires". Verified
-          # against real output rather than assumed.
-          clean=$("$bin" --version 2>&1 | sed 's/\x1b\[[0-9;]*m//g')
+          # "could not determine which toolchain Verus requires".
+          clean=$(printf '%s\n' "$raw" | sed 's/\x1b\[[0-9;]*m//g')
+          printf '%s\n' "$clean"
           need=$(printf '%s\n' "$clean" \
             | sed -n 's/^[[:space:]]*rustup install \([^[:space:]]*\).*$/\1/p' | head -1)
           if [ -z "$need" ]; then
             echo "::error::could not determine which toolchain Verus requires"
-            printf '%s\n' "$clean"
             exit 1
           fi
           echo "Verus requires: $need"
