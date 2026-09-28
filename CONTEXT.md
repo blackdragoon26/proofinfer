@@ -1,6 +1,6 @@
 # CONTEXT.md
 
-Design notes for `tinyinfer`. This is the working document I keep open while
+Design notes for `proofinfer`. This is the working document I keep open while
 building, and the thing I would hand to a reviewer who asks "why is it like
 this?".
 

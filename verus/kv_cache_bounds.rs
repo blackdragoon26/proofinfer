@@ -1,4 +1,4 @@
-//! Index safety for tinyinfer's KV-cache slicing.
+//! Index safety for proofinfer's KV-cache slicing.
 //!
 //! A self-contained Verus development proving the property named in
 //! CONTEXT.md section 10, question 7:

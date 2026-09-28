@@ -12,7 +12,7 @@
 //! file that caused it. The positive tests at the bottom of this file check
 //! buffer lengths against the config for exactly that reason.
 
-use tinyinfer::model::{Config, LoadError, Weights};
+use proofinfer::model::{Config, LoadError, Weights};
 
 // ---------------------------------------------------------------------------
 // Test fixture: build well-formed checkpoints

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Differential test: tinyinfer (Rust) against the llama2.c reference (PyTorch).
+"""Differential test: proofinfer (Rust) against the llama2.c reference (PyTorch).
 
 The claim being tested is narrow and checkable: for the same weights and the
 same token sequence, both implementations produce the same logits at every
@@ -10,7 +10,7 @@ the file format:
 
 * The reference does a **batched** forward pass over the whole sequence with a
   causal mask (`scaled_dot_product_attention(..., is_causal=True)`).
-* tinyinfer decodes **one token at a time** with a KV cache, computing its own
+* proofinfer decodes **one token at a time** with a KV cache, computing its own
   RoPE from `theta` and `pos` rather than reading the `freq_cis` table the file
   also contains, and mapping grouped-query heads by index division rather than by
   `torch.repeat_interleave`.
@@ -27,7 +27,7 @@ bitwise comparison would be testing the summation order, not the model.
 
 Usage:
     python3 reference/diff_test.py
-    python3 reference/diff_test.py --binary ./target/release/tinyinfer
+    python3 reference/diff_test.py --binary ./target/release/proofinfer
     python3 reference/diff_test.py --config tiny --config mqa
     python3 reference/diff_test.py --checkpoint stories15M.pt -n 200
 """
@@ -417,8 +417,8 @@ def main() -> int:
     parser.add_argument(
         "--binary",
         type=Path,
-        default=REPO / "target" / "release" / "tinyinfer",
-        help="path to the built tinyinfer binary",
+        default=REPO / "target" / "release" / "proofinfer",
+        help="path to the built proofinfer binary",
     )
     parser.add_argument("--seed", type=int, default=1234, help="base RNG seed")
     parser.add_argument(

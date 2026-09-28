@@ -1,4 +1,4 @@
-//! tinyinfer: a dependency-free Llama inference engine.
+//! proofinfer: a dependency-free Llama inference engine.
 //!
 //! The crate is built on `std` alone. There is no `clap`, no `serde`, no
 //! `tokenizers`, no `safetensors`. That is a deliberate constraint rather than

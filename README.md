@@ -1,4 +1,4 @@
-# tinyinfer
+# proofinfer
 
 A Llama-architecture inference engine in Rust with **zero external crates**,
 built around a claim that is usually made and rarely justified: that it
@@ -155,7 +155,7 @@ red. This is the inventory:
 | `diff_test.py` (6 configs) | 10 injected bugs, `mutation_check.py`, 10/10 |
 | `cargo test` (75 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 |
 | byte-identical greedy output | a RoPE-less mutant binary: `bench.py` reports `DIFFERENT` and exits 1 |
-| zero-dependency assertion | a `Cargo.lock` with a second package, with zero packages, and naming a package that is not `tinyinfer` — all three rejected |
+| zero-dependency assertion | a `Cargo.lock` with a second package, with zero packages, and naming a package that is not `proofinfer` — all three rejected |
 | `verus/check_citations.py` | GQA mapping mutated in place, nine lines inserted to shift every citation, attention window changed, a cache write deleted; plus a missing source file, an unregistered citation, and a rotted table entry |
 | CI workflow wiring | every `steps.<id>.outputs.<name>` resolves to a step that writes it, every `run:` block parses as bash, no `\|\| true` outside comments |
 | Verus itself | `--no-cheating` rejects `assume` / `admit` / `external_body`; the unmutated baseline is run first so "24 verified" cannot mean "the file does not parse" |
@@ -168,7 +168,7 @@ The full-run commands are in the repository, not just in a shell history:
 
 The two implementations share nothing but the file format.
 
-|  | reference (PyTorch) | tinyinfer (Rust) |
+|  | reference (PyTorch) | proofinfer (Rust) |
 |---|---|---|
 | forward pass | batched over the whole sequence | one token at a time |
 | attention | `scaled_dot_product_attention(is_causal=True)` | explicit loop over the KV cache |
@@ -218,15 +218,15 @@ timing one.
 
 | engine | tok/s |
 |---|---|
-| tinyinfer, serial `.sum()` dot product | 154.3 |
-| tinyinfer, 8 accumulators, indexed loop | 207.9 |
-| tinyinfer, 8 accumulators, `chunks_exact` | 835.4 |
-| tinyinfer, same, plus `-C target-cpu=native` | 836.8 |
+| proofinfer, serial `.sum()` dot product | 154.3 |
+| proofinfer, 8 accumulators, indexed loop | 207.9 |
+| proofinfer, 8 accumulators, `chunks_exact` | 835.4 |
+| proofinfer, same, plus `-C target-cpu=native` | 836.8 |
 | llama2.c `run.c`, `-O3 -march=native` | 146.8 |
 | llama2.c `run.c`, `-Ofast` | 973.6 |
 
 Greedy output is **byte-identical** to both `run.c` builds across all 248
-tokens, for all four tinyinfer variants.
+tokens, for all four proofinfer variants.
 
 ### The 8-lane dot product, including the part I got wrong
 
@@ -299,7 +299,7 @@ not the target flag, is what unlocked the vectorisation.
 ## Repository layout
 
 ```
-tinyinfer/
+proofinfer/
   Cargo.toml                 no [dependencies]; release profile: opt-level 3, lto, codegen-units 1
   LICENSE                    MIT
   CONTEXT.md                 design notes: format, forward pass, gotchas, TCB
@@ -348,7 +348,7 @@ with contextlib.redirect_stdout(io.StringIO()):
     legacy_export(load_checkpoint("stories15M.pt"), "stories15M.bin")
 PY
 
-./target/release/tinyinfer stories15M.bin \
+./target/release/proofinfer stories15M.bin \
     -z reference/llama2c/tokenizer.bin -i "Once upon a time" -n 248
 ```
 

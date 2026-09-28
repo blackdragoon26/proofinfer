@@ -1,4 +1,4 @@
-# CI for tinyinfer.
+# CI for proofinfer.
 #
 # Three jobs, and the split is the point: the cheap correctness checks are
 # separate from the expensive differential ones, so a reviewer opening this file
@@ -87,12 +87,12 @@ jobs:
             awk '/^\[\[package\]\]/{getline n; print n}' Cargo.lock
             exit 1
           fi
-          if ! grep -q '^name = "tinyinfer"$' Cargo.lock; then
-            echo "::error::the only package in Cargo.lock must be tinyinfer itself"
+          if ! grep -q '^name = "proofinfer"$' Cargo.lock; then
+            echo "::error::the only package in Cargo.lock must be proofinfer itself"
             cat Cargo.lock
             exit 1
           fi
-          echo "Cargo.lock contains exactly one package: tinyinfer"
+          echo "Cargo.lock contains exactly one package: proofinfer"
 
       # --locked fails if Cargo.lock is out of date with Cargo.toml, which is
       # what stops a dependency change from being quietly committed without the

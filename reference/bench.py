@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark tinyinfer against llama2.c's C engine, and check they agree.
+"""Benchmark proofinfer against llama2.c's C engine, and check they agree.
 
 Two things happen here, and the second is the more important one:
 
@@ -15,7 +15,7 @@ Two things happen here, and the second is the more important one:
    and it is a genuinely independent check because `run.c` is a third
    implementation with its own matmul, its own softmax and its own RoPE.
 
-The comparison strips a single trailing newline from both sides. tinyinfer
+The comparison strips a single trailing newline from both sides. proofinfer
 prints one so the shell prompt starts on a fresh line; `run.c` does not. Nothing
 else is normalised - if the two engines disagree by so much as one token, this
 fails.
@@ -45,9 +45,9 @@ TOKENIZER = REPO / "reference" / "llama2c" / "tokenizer.bin"
 
 # run.c reports throughput on stderr as "achieved tok/s: <float>".
 TPS_RE = re.compile(r"achieved tok/s:\s*([0-9.]+)")
-# tinyinfer reports it as "generated N tokens in T s (X tok/s, M tokens processed)".
+# proofinfer reports it as "generated N tokens in T s (X tok/s, M tokens processed)".
 TINY_TPS_RE = re.compile(r"\(([0-9.]+) tok/s")
-# tinyinfer reports the encoded prompt length on stderr.
+# proofinfer reports the encoded prompt length on stderr.
 PROMPT_TOKENS_RE = re.compile(r"prompt:\s*(\d+)\s*tokens")
 
 
@@ -96,7 +96,7 @@ def bench(engine: Engine, runs: int) -> tuple[list[float], bytes]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--model", type=Path, required=True, help="legacy-format .bin")
-    parser.add_argument("--binary", type=Path, default=REPO / "target/release/tinyinfer")
+    parser.add_argument("--binary", type=Path, default=REPO / "target/release/proofinfer")
     parser.add_argument("--prompt", default="Once upon a time")
     parser.add_argument(
         "--n", type=int, default=0, help="tokens to generate; 0 means fill the context"
@@ -143,7 +143,7 @@ def main() -> int:
         "-n",
         str(n),
     ]
-    tiny = Engine("tinyinfer", tiny_cmd, TINY_TPS_RE)
+    tiny = Engine("proofinfer", tiny_cmd, TINY_TPS_RE)
 
     # run.c's `-n` counts *total* forward passes from position 0, prompt
     # included: its loop is `while (pos < steps)` with pos starting at 0. Ours
@@ -152,13 +152,13 @@ def main() -> int:
     # reason that has nothing to do with the maths - which is exactly the kind
     # of false failure that trains you to ignore the check.
     #
-    # So: learn the prompt length from tinyinfer's own stderr, then ask run.c
+    # So: learn the prompt length from proofinfer's own stderr, then ask run.c
     # for `prompt + n` total steps. Both then generate exactly `n` tokens.
     probe_tps, probe_out, probe_err = tiny.run()
     m = PROMPT_TOKENS_RE.search(probe_err)
     if not m:
         raise RuntimeError(
-            f"could not read the encoded prompt length from tinyinfer's stderr; "
+            f"could not read the encoded prompt length from proofinfer's stderr; "
             f"got:\n{probe_err.strip()}"
         )
     prompt_tokens = int(m.group(1))

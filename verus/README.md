@@ -196,7 +196,7 @@ RUSTUP_HOME=$HOME/.jcode/scratch/rustup CARGO_HOME=$HOME/.jcode/scratch/cargo \
   rustup toolchain install 1.98.1-aarch64-apple-darwin
 
 # 3. Run the verifier on the model file.
-cd /path/to/tinyinfer
+cd /path/to/proofinfer
 RUSTUP_HOME=$HOME/.jcode/scratch/rustup CARGO_HOME=$HOME/.jcode/scratch/cargo \
   "$HOME/.jcode/scratch/verus-dl/verus-arm64-macos/verus" \
   --crate-type lib --no-cheating verus/kv_cache_bounds.rs

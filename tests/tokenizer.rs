@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use tinyinfer::tokenizer::{Tokenizer, BOS_ID, EOS_ID, LLAMA2_VOCAB_SIZE, UNK_ID};
+use proofinfer::tokenizer::{Tokenizer, BOS_ID, EOS_ID, LLAMA2_VOCAB_SIZE, UNK_ID};
 
 fn tokenizer() -> Tokenizer {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference/llama2c/tokenizer.bin");
@@ -310,7 +310,7 @@ fn trailing_bytes_in_the_vocabulary_are_an_error() {
     data.push(0);
     let err = Tokenizer::from_bytes(&data, LLAMA2_VOCAB_SIZE).unwrap_err();
     assert!(
-        matches!(err, tinyinfer::tokenizer::TokenizerError::TrailingBytes(1)),
+        matches!(err, proofinfer::tokenizer::TokenizerError::TrailingBytes(1)),
         "got {err:?}"
     );
 }

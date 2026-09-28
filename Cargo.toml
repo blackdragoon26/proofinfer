@@ -1,5 +1,5 @@
 [package]
-name = "tinyinfer"
+name = "proofinfer"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
@@ -14,11 +14,11 @@ publish = false
 [dependencies]
 
 [lib]
-name = "tinyinfer"
+name = "proofinfer"
 path = "src/lib.rs"
 
 [[bin]]
-name = "tinyinfer"
+name = "proofinfer"
 path = "src/main.rs"
 
 # Release profile tuned for inference throughput.

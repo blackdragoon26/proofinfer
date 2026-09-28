@@ -16,7 +16,7 @@
 //!   the prompt. Two runs must produce identical token ids, because the
 //!   byte-identical comparison against llama2.c's `run.c` depends on it.
 
-use tinyinfer::model::{argmax, generate, Config, State, Weights};
+use proofinfer::model::{argmax, generate, Config, State, Weights};
 
 /// Build a small but well-formed legacy-format checkpoint.
 ///
@@ -107,7 +107,7 @@ fn forward_rejects_a_token_outside_the_vocabulary() {
     let err = s.forward(&w, w.config.vocab_size as u32, 0).unwrap_err();
     assert!(matches!(
         err,
-        tinyinfer::model::RunError::TokenOutOfRange { .. }
+        proofinfer::model::RunError::TokenOutOfRange { .. }
     ));
     // i32::MAX is a token id a fuzzer would happily produce.
     assert!(s.forward(&w, u32::MAX, 0).is_err());
@@ -336,7 +336,7 @@ fn generate_stops_on_bos_because_bos_delimits_documents() {
     let logits = probe.forward(&w, 0, 0).unwrap();
     assert_eq!(
         argmax(logits).0 as u32,
-        tinyinfer::tokenizer::BOS_ID,
+        proofinfer::tokenizer::BOS_ID,
         "fixture is wrong: the first step must predict BOS"
     );
 
@@ -358,7 +358,7 @@ fn generate_keeps_going_when_the_next_token_is_not_bos() {
     let logits = probe.forward(&w, 2, 0).unwrap();
     assert_ne!(
         argmax(logits).0 as u32,
-        tinyinfer::tokenizer::BOS_ID,
+        proofinfer::tokenizer::BOS_ID,
         "fixture is wrong: token 2 must not be a terminator"
     );
 
@@ -457,7 +457,7 @@ fn generate_rejects_a_prompt_longer_than_the_context() {
     let err = generate(&w, &mut State::new(&w.config).unwrap(), &too_long, 1).unwrap_err();
     assert!(matches!(
         err,
-        tinyinfer::model::RunError::TooManyTokens { .. }
+        proofinfer::model::RunError::TooManyTokens { .. }
     ));
     // Exactly filling the context is allowed.
     assert!(generate(&w, &mut State::new(&w.config).unwrap(), &too_long, 0).is_ok());
@@ -518,7 +518,7 @@ fn state_rejects_a_config_whose_cache_would_overflow() {
     // future change that rejects this config for an unrelated reason would
     // keep the test green while the overflow path went untested.
     match State::new(&cfg) {
-        Err(tinyinfer::model::LoadError::Overflow { what }) => {
+        Err(proofinfer::model::LoadError::Overflow { what }) => {
             assert_eq!(what, "kv cache");
         }
         Err(other) => panic!("expected an overflow error, got {other:?}"),

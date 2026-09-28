@@ -177,7 +177,7 @@ def engine_binary(target: Path) -> Path:
     points at a stale or absent binary and quietly turns the whole check into a
     no-op, so it is computed in one place.
     """
-    return target / "release" / "tinyinfer"
+    return target / "release" / "proofinfer"
 
 
 def check_baseline(crate: Path, target: Path, env: dict[str, str]) -> tuple[bool, str]:
@@ -311,8 +311,8 @@ def main() -> int:
             return 2
         selected = tuple(m for m in MUTANTS if m.name in wanted)
 
-    workdir = Path(tempfile.mkdtemp(prefix="tinyinfer-mutants-"))
-    crate = workdir / "tinyinfer"
+    workdir = Path(tempfile.mkdtemp(prefix="proofinfer-mutants-"))
+    crate = workdir / "proofinfer"
     crate.mkdir()
     for item in COPY:
         src = REPO / item

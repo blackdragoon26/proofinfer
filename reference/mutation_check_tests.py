@@ -135,7 +135,7 @@ MUTANTS = [
 
 def main() -> int:
     work = Path(tempfile.mkdtemp(prefix="rust-mutants-"))
-    crate = work / "tinyinfer"
+    crate = work / "proofinfer"
     shutil.copytree(REPO / "src", crate / "src")
     shutil.copytree(REPO / "tests", crate / "tests")
     for f in ("Cargo.toml", "Cargo.lock", "reference"):

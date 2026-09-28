@@ -3,8 +3,8 @@
 //! Two modes:
 //!
 //! ```text
-//! tinyinfer model.bin -z tokenizer.bin -i "Once upon a time" -n 256
-//! tinyinfer model.bin --tokens 1,450,2462 --dump-logits out.f32
+//! proofinfer model.bin -z tokenizer.bin -i "Once upon a time" -n 256
+//! proofinfer model.bin --tokens 1,450,2462 --dump-logits out.f32
 //! ```
 //!
 //! The first is interactive greedy generation. The second is the mode the
@@ -31,15 +31,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use tinyinfer::model::{self, State, Weights};
-use tinyinfer::tokenizer::Tokenizer;
+use proofinfer::model::{self, State, Weights};
+use proofinfer::tokenizer::Tokenizer;
 
 const USAGE: &str = "\
-tinyinfer - a dependency-free Llama inference engine
+proofinfer - a dependency-free Llama inference engine
 
 USAGE:
-    tinyinfer <model.bin> -z <tokenizer.bin> -i <text> -n <count>
-    tinyinfer <model.bin> --tokens <t0,t1,...> [--dump-logits <out.f32>]
+    proofinfer <model.bin> -z <tokenizer.bin> -i <text> -n <count>
+    proofinfer <model.bin> --tokens <t0,t1,...> [--dump-logits <out.f32>]
 
 MODES:
     With -i/--input, the text is tokenised and <count> tokens are generated
@@ -60,8 +60,8 @@ OPTIONS:
     -V, --version             print the version
 
 EXAMPLES:
-    tinyinfer stories15M.bin -z tokenizer.bin -i \"Once upon a time\" -n 256
-    tinyinfer tiny.bin --tokens 1,450,2462 --dump-logits out.f32
+    proofinfer stories15M.bin -z tokenizer.bin -i \"Once upon a time\" -n 256
+    proofinfer tiny.bin --tokens 1,450,2462 --dump-logits out.f32
 ";
 
 /// A command-line usage error. Not a model error: it means the invocation was
@@ -240,7 +240,7 @@ fn main() -> ExitCode {
     match run(&argv) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("tinyinfer: {e}");
+            eprintln!("proofinfer: {e}");
             ExitCode::FAILURE
         }
     }
@@ -253,7 +253,7 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
             return Ok(ExitCode::SUCCESS);
         }
         Action::Version => {
-            println!("tinyinfer {}", env!("CARGO_PKG_VERSION"));
+            println!("proofinfer {}", env!("CARGO_PKG_VERSION"));
             return Ok(ExitCode::SUCCESS);
         }
         Action::Run(a) => *a,
