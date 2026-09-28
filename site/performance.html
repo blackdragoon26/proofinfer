@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Performance &middot; proofinfer</title>
+<meta name="description" content="proofinfer — Performance: throughput, the 8-lane dot product, and the gap left by -Ofast">
+<link rel="stylesheet" href="style.css">
+<script src="motion.js" defer></script>
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+
+<nav>
+<div class="navlinks"><a href="index.html">Proof</a><a href="testing.html">Testing</a><a href="performance.html" class="here">Performance</a><a href="design.html">Design</a></div><div class="navbtns"><a class="btn" href="https://github.com/blackdragoon26/proofinfer">Repository</a><a class="btn" href="https://sankalpjha.dev/">Sankalp</a></div>
+</nav>
+
+<main class="doc">
+<h1>Performance</h1>
+<p>Throughput, the optimisation that produced it, and the gap that is left over. Every number here was produced by <code>reference/bench.py</code> on the machine named in the file.</p>
+
+<p><a href="https://github.com/blackdragoon26/proofinfer/blob/main/README.md">Back to the README</a></p>
+
+<h3>Benchmark</h3>
+<p>Apple M3, macOS 26.4.1, rustc 1.98.0, Apple clang 21.0.0. Single threaded. stories15M (dim 288, 6 layers, 6 heads, vocab 32000, context 256), 248 generated greedy tokens, 5 runs, median.</p>
+
+<p>Every row was measured in a single session on an <strong>otherwise idle</strong> machine, with the same <code>run.c</code> binaries, so no row is quoted from a run with different load than the others.</p>
+
+<p><strong>These absolute numbers are not reproducible on a busy machine, and the table should be read with that in mind.</strong> Measured later on the same machine while a load average of ~5.7 was running (browser, compilers, terminal), the same 7-run measurement gave 619 tok/s with individual runs spanning <strong>431 to 674</strong> — a 56% spread, not the few percent an idle machine shows. The first run after a rebuild is also reliably ~12% slow, from page faults on the 60 MB checkpoint.</p>
+
+<p>So: quote these figures as "what this engine did on an idle M3", and use them for ratios rather than absolutes. What <em>is</em> reproducible under any load is the byte-identity result below, because that is a correctness claim rather than a timing one.</p>
+
+<table>
+<thead><tr><th>engine</th><th>tok/s</th></tr></thead>
+<tbody>
+<tr><td>proofinfer, serial <code>.sum()</code> dot product</td><td>154.3</td></tr>
+<tr><td>proofinfer, 8 accumulators, indexed loop</td><td>207.9</td></tr>
+<tr><td>proofinfer, 8 accumulators, <code>chunks_exact</code></td><td>835.4</td></tr>
+<tr><td>proofinfer, same, plus <code>-C target-cpu=native</code></td><td>836.8</td></tr>
+<tr><td>llama2.c <code>run.c</code>, <code>-O3 -march=native</code></td><td>146.8</td></tr>
+<tr><td>llama2.c <code>run.c</code>, <code>-Ofast</code></td><td>973.6</td></tr>
+</tbody></table>
+
+<p>Greedy output is <strong>byte-identical</strong> to both <code>run.c</code> builds across all 248 tokens, for all four proofinfer variants.</p>
+
+<h4>The 8-lane dot product, including the part I got wrong</h4>
+<p><code>a.iter().zip(b).map(|(x, y)| x * y).sum()</code> compiles to a serial chain of floating-point additions. Since addition is not associative, LLVM is <em>forbidden</em> from splitting that chain into parallel partial sums, because doing so would change the answer. One loop-carried dependency per multiply is a latency wall that no amount of <code>-O3</code> gets past.</p>
+
+<p>Eight independent accumulators remove the dependency. That is the standard advice, and following it exactly gets you to 207.9 tok/s — a real 1.35x, and most of the way short of the real win.</p>
+
+<p>Written that way:</p>
+
+<pre><code class="lang-rust">while i + 8 &lt;= n { for lane in 0..8 { acc[lane] += a[i + lane] * b[i + lane]; } }</code></pre>
+
+<p>the eight lanes become eight independent <strong>scalar</strong> chains. The dependency is gone, but LLVM's loop vectoriser does not fire on that form at all. Rewriting the identical arithmetic as <code>chunks_exact(8)</code> reaches 835.4 tok/s, a further 4.0x, because it presents the eight values as one contiguous chunk and the superword-level pass can pack them into vectors.</p>
+
+<p>Measured in isolation at <code>dim = 288</code> (the model's hidden size), in Gelem/s:</p>
+
+<table>
+<thead><tr><th>dot product form</th><th>Gelem/s</th></tr></thead>
+<tbody>
+<tr><td>serial <code>.sum()</code></td><td>2.2</td></tr>
+<tr><td>8 accumulators, indexed loop</td><td>3.3</td></tr>
+<tr><td>8 accumulators, <code>chunks_exact(8)</code></td><td>14.6</td></tr>
+</tbody></table>
+
+<p>The indexed form is a 1.5x on the kernel, and looks like the optimisation worked. It is 4.4x short of what the same arithmetic can do.</p>
+
+<p>Nothing is reassociated in either version. Each lane is still a strict left-to-right sum; the eight lanes are just eight interleaved ordered sums. The last bits of the result do change, which is precisely why the differential test is tolerance-based — and the diff test, the mutation check and the byte-identical comparison were all re-run after this change.</p>
+
+<h4>The <code>-Ofast</code> gap, reported honestly</h4>
+<p><code>run.c -Ofast</code> is 973.6 tok/s and still faster than the 835.4 tok/s this engine reaches with an optimising Rust compiler and explicit SIMD. The gap is about 1.17x.</p>
+
+<p><code>-Ofast</code> enables <code>-ffast-math</code>, which lets clang reassociate floating-point additions <em>anywhere</em> it likes, including the attention and value-accumulation loops, not just the matmul. This project restricts itself to one documented reassociation in one function, because unrestricted reassociation across the whole forward pass makes the numerics much harder to reason about and much easier to break silently.</p>
+
+<p>The 1.17x is the price of that choice. It is a real cost, reported rather than hidden: the honest summary is that clang, allowed to assume the IEEE 754 rules do not apply, extracts more than a conforming compiler can, and that some of what it extracts is available to a conforming compiler if you write the loop in the right shape — as the <code>chunks_exact</code> result above demonstrates — and some of it is not.</p>
+
+<p><code>-C target-cpu=native</code> adds 0.2% here (835.4 → 836.8), which is inside the run-to-run noise. That is worth stating plainly because it is not the result one would predict from an x86 machine with AVX-512: on aarch64 the baseline codegen already saturates the available NEON width for this loop, so there is nothing left for a more specific target to unlock. The <code>chunks_exact</code> rewrite, not the target flag, is what unlocked the vectorisation.</p>
+
+<p class="source">Source: <a href="https://github.com/blackdragoon26/proofinfer/blob/main/docs/performance.md">https://github.com/blackdragoon26/proofinfer/blob/main/docs/performance.md</a> in the repository.</p>
+</main>
+
+</body>
+</html>

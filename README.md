@@ -79,6 +79,7 @@ python -m venv .venv
 | [docs/design.md](docs/design.md) | architecture, the decisions worth defending, trusted computing base, and what is *not* verified |
 | [CONTEXT.md](CONTEXT.md) | working design notes kept during the build |
 | [verus/README.md](verus/README.md) | the formal proof, its scope, and its eleven stated limitations |
+| [site/](site/) | the landing page — static, generated from these docs, no build step |
 
 ## Honest limits
 

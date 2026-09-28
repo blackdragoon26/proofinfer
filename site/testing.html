@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Testing &middot; proofinfer</title>
+<meta name="description" content="proofinfer — Testing: how correctness is established, and how every check was shown to fail">
+<link rel="stylesheet" href="style.css">
+<script src="motion.js" defer></script>
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+
+<nav>
+<div class="navlinks"><a href="index.html">Proof</a><a href="testing.html" class="here">Testing</a><a href="performance.html">Performance</a><a href="design.html">Design</a></div><div class="navbtns"><a class="btn" href="https://github.com/blackdragoon26/proofinfer">Repository</a><a class="btn" href="https://sankalpjha.dev/">Sankalp</a></div>
+</nav>
+
+<main class="doc">
+<h1>Testing</h1>
+<p>How this project establishes that it computes the right thing, and how each of those checks was shown to be capable of failing.</p>
+
+<p>The short version: a differential harness against the PyTorch reference, a byte-for-byte comparison against the reference C engine, and two mutation checks that prove both halves of the test suite can actually fail.</p>
+
+<p><a href="https://github.com/blackdragoon26/proofinfer/blob/main/README.md">Back to the README</a></p>
+
+<h3>Results</h3>
+<p>All numbers below were produced by the commands in this file on the machine measured in <a href="https://github.com/blackdragoon26/proofinfer/blob/main/docs/performance.md">performance.md</a>. Nothing here is quoted from anywhere else.</p>
+
+<h4>Differential test, random weights</h4>
+<p><code>python reference/diff_test.py</code> — pass requires <code>|err| &lt;= 1e-4 + 1e-4*|ref|</code> at <em>every</em> logit and argmax agreement at <em>every</em> position.</p>
+
+<table>
+<thead><tr><th>config</th><th>dim</th><th>heads / kv</th><th>layers</th><th>vocab</th><th>seq</th><th>classifier</th><th>max&nbsp;|err|</th><th>max&nbsp;|ref|</th><th>err/tol</th><th>top-1</th></tr></thead>
+<tbody>
+<tr><td><code>tiny</code></td><td>64</td><td>4 / 4</td><td>2</td><td>97</td><td>32</td><td>tied</td><td>3.87e-06</td><td>4.22</td><td>0.030</td><td>32/32</td></tr>
+<tr><td><code>gqa-2x</code></td><td>64</td><td>8 / 4</td><td>3</td><td>128</td><td>48</td><td>tied</td><td>4.17e-06</td><td>4.17</td><td>0.028</td><td>48/48</td></tr>
+<tr><td><code>gqa-4x</code></td><td>96</td><td>8 / 2</td><td>2</td><td>200</td><td>64</td><td>tied</td><td>5.72e-06</td><td>4.98</td><td>0.046</td><td>64/64</td></tr>
+<tr><td><code>mqa</code></td><td>64</td><td>4 / 1</td><td>2</td><td>64</td><td>40</td><td>tied</td><td>2.87e-06</td><td>4.57</td><td>0.026</td><td>40/40</td></tr>
+<tr><td><code>untied-cls</code></td><td>128</td><td>4 / 4</td><td>4</td><td>512</td><td>64</td><td><strong>untied</strong></td><td>9.66e-06</td><td>5.23</td><td>0.071</td><td>64/64</td></tr>
+<tr><td><code>full-context</code></td><td>48</td><td>2 / 2</td><td>1</td><td>50</td><td>128</td><td>tied</td><td>5.01e-06</td><td>4.50</td><td>0.029</td><td>128/128</td></tr>
+</tbody></table>
+
+<p><strong>6/6 pass.</strong> Worst case uses 7.1% of the allowed budget. Top-1 agreement is 100% everywhere.</p>
+
+<p><code>max|ref|</code> is printed on purpose. It is the evidence that the weights were re-randomised: llama2.c initialises matrices with <code>std=0.02</code>, which makes the logits nearly flat, and a flat output lets a whole family of genuinely wrong implementations land inside the tolerance. A max logit of ~5 rather than ~1e-3 means the test is measuring the arithmetic and not the tolerance.</p>
+
+<h4>Differential test, real weights</h4>
+<p><code>python reference/diff_test.py --checkpoint stories15M.pt -n 200</code></p>
+
+<table>
+<thead><tr><th>model</th><th>max&nbsp;|err|</th><th>max&nbsp;|ref|</th><th>err/tol</th><th>top-1</th><th>result</th></tr></thead>
+<tbody>
+<tr><td>stories15M (15M params, vocab 32000)</td><td>3.34e-05</td><td>26.2</td><td>0.192</td><td>200/200</td><td>PASS</td></tr>
+</tbody></table>
+
+<p>The 200-token sequence is chosen by the <em>reference</em> greedy decoder, so the engine is being compared on a sequence an independent implementation produced.</p>
+
+<h4>Mutation check</h4>
+<p><code>python reference/mutation_check.py</code></p>
+
+<table>
+<thead><tr><th>mutant</th><th>caught by</th></tr></thead>
+<tbody>
+<tr><td>RoPE exponent <code>2i</code> → <code>i</code></td><td>all six</td></tr>
+<tr><td>RoPE skipped on keys</td><td>all six</td></tr>
+<tr><td>GQA mapping <code>h / kv_mul</code> → <code>h % n_kv_heads</code></td><td><strong>gqa-2x, gqa-4x only</strong></td></tr>
+<tr><td>Attention window <code>pos + 1</code> → <code>pos.max(1)</code></td><td>all six</td></tr>
+<tr><td>Attention scale removed</td><td>all six</td></tr>
+<tr><td>RMSNorm eps <code>1e-5</code> → <code>1e-27</code></td><td>all six</td></tr>
+<tr><td>SwiGLU gate and up swapped</td><td>all six</td></tr>
+<tr><td>Untied classifier ignored</td><td><strong>untied-cls only</strong></td></tr>
+<tr><td>Residual <code>x += d</code> → <code>x = d</code></td><td>all six</td></tr>
+<tr><td>RoPE theta 10000 → 500000</td><td>all six</td></tr>
+</tbody></table>
+
+<p>"all six" means <code>tiny, gqa-2x, gqa-4x, mqa, untied-cls, full-context</code>, the order the harness reports them in.</p>
+
+<p><strong>10/10 caught.</strong> The whole run takes roughly 20-30 seconds, dominated by rebuilding the crate ten times; every mutant shares one <code>CARGO_TARGET_DIR</code> and runs with LTO disabled, since LTO is the slowest part of the build and has no bearing on which mutants get caught.</p>
+
+<p>The per-mutant column is the useful part, and it is why the configurations are chosen the way they are. <code>gqa-modulo-mapping</code> is caught by the two GQA configurations and nothing else, because modulo and division agree when <code>kv_heads == n_heads</code> — the other four configurations cannot see that bug at all. <code>ignore-untied-classifier</code> is caught by <code>untied-cls</code> alone, for the mirror-image reason. If every mutant had been caught by all six configurations, that would have looked like thoroughness and actually meant the suite had no discrimination.</p>
+
+<p>Two guards keep that number honest:</p>
+
+<ul>
+<li>Each mutation's replacement snippet must occur <strong>exactly once</strong> in the source. Otherwise a refactor turns the mutant into a no-op, the harness correctly reports a pass, and "the test passed" becomes indistinguishable from "the bug slipped through".</li>
+<li>The <strong>unmutated source is checked first</strong>. "10/10 caught" would otherwise be consistent with "10/10 failed for an unrelated reason".</li>
+</ul>
+
+<h4>Rust tests, and proof they can fail</h4>
+<p>75 tests, passing in both release and debug (debug matters: it enables integer overflow checks, which is where a wrapping size computation in the loader would show up).</p>
+
+<table>
+<thead><tr><th>suite</th><th>tests</th><th>what it covers</th></tr></thead>
+<tbody>
+<tr><td><code>src/ops.rs</code></td><td>23</td><td>kernels against hand-computed answers, RoPE invariants <em>and</em> its frequency schedule, causality of the attention window, <code>dot</code> across every length mod 8</td></tr>
+<tr><td><code>tests/loader.rs</code></td><td>18</td><td>totality over hostile input, 2000 pseudo-random buffers, overflow, tensor ordering</td></tr>
+<tr><td><code>tests/tokenizer.rs</code></td><td>16</td><td>exact conformance to Meta's published token ids, byte fallback, round trips</td></tr>
+<tr><td><code>tests/engine.rs</code></td><td>18</td><td>causality, determinism, BOS termination, <code>State::reset</code> equivalence, <code>argmax</code> totality on NaN</td></tr>
+</tbody></table>
+
+<p>But a passing suite only says the tests agree with the code. It does not say they can <em>notice</em> disagreement, so <code>reference/mutation_check_tests.py</code> injects 21 realistic bugs one at a time and requires <code>cargo test</code> to fail on every one. <strong>21/21 caught.</strong> It is the same discipline as <code>mutation_check.py</code>, pointed at the other half of the project: that one proves the differential harness can fail, this one proves the Rust tests can.</p>
+
+<p>Running it found two genuine blind spots, both of which were real holes in the suite rather than in the mutants:</p>
+
+<ul>
+<li><strong>The RoPE tests could not see the RoPE frequencies.</strong> All four were <em>structural</em> invariants — identity at pos 0, pair-norm preservation, no head mixing, the relative-position property — and every one of them is satisfied by a rotation through <em>any</em> angle. So <code>2 * i</code> → <code>i</code> produced angles that are wrong everywhere and passed the lot. The differential harness caught it; the unit suite on its own could not. There is now a test that computes the expected angle from the documented schedule and compares.</li>
+<li><strong>Nothing covered generation's BOS termination.</strong> That is the bug the byte-identity check found by hand, and the differential harness cannot see it because it never looks at text. There is now an engineered checkpoint whose first greedy step emits BOS, plus its mirror so the first test cannot pass for the wrong reason.</li>
+</ul>
+
+<p>A third finding was subtler and worth naming: <code>state_rejects_a_config_whose_cache_would_overflow</code> was using <code>i32::MAX</code> as <code>dim</code>, which is <em>odd</em>, so <code>State::new</code> rejected the odd head size and returned <code>InvalidHeader</code>. The test passed without ever reaching the arithmetic it is named after. It now uses an even <code>dim</code>, asserts the config is structurally valid, and asserts the specific <code>Overflow { what: "kv cache" }</code> error rather than merely that some error occurred.</p>
+
+<h4>Every check, and how it was shown to fail</h4>
+<p>A check that has only ever been observed passing is consistent with a check that cannot fail. So each one was also exercised in a state where it had to go red. This is the inventory:</p>
+
+<table>
+<thead><tr><th>check</th><th>how it was shown to fail</th></tr></thead>
+<tbody>
+<tr><td><code>diff_test.py</code> (6 configs)</td><td>10 injected bugs, <code>mutation_check.py</code>, 10/10</td></tr>
+<tr><td><code>cargo test</code> (75 tests)</td><td>21 injected bugs, <code>mutation_check_tests.py</code>, 21/21</td></tr>
+<tr><td>byte-identical greedy output</td><td>a RoPE-less mutant binary: <code>bench.py</code> reports <code>DIFFERENT</code> and exits 1</td></tr>
+<tr><td>zero-dependency assertion</td><td>a <code>Cargo.lock</code> with a second package, with zero packages, and naming a package that is not <code>proofinfer</code> — all three rejected</td></tr>
+<tr><td><code>verus/check_citations.py</code></td><td>GQA mapping mutated in place, nine lines inserted to shift every citation, attention window changed, a cache write deleted; plus a missing source file, an unregistered citation, and a rotted table entry</td></tr>
+<tr><td>CI workflow wiring</td><td>every <code>steps.&lt;id&gt;.outputs.&lt;name&gt;</code> resolves to a step that writes it, every <code>run:</code> block parses as bash, no <code>|| true</code> outside comments</td></tr>
+<tr><td>Verus itself</td><td><code>--no-cheating</code> rejects <code>assume</code> / <code>admit</code> / <code>external_body</code>; the unmutated baseline is run first so "24 verified" cannot mean "the file does not parse"</td></tr>
+</tbody></table>
+
+<p>The full-run commands are in the repository, not just in a shell history: <code>reference/mutation_check.py</code>, <code>reference/mutation_check_tests.py</code>, and <code>verus/check_citations.py</code> all exit non-zero on failure and all run in CI.</p>
+
+<h3>Why the differential test is worth anything</h3>
+<p>The two implementations share nothing but the file format.</p>
+
+<table>
+<thead><tr><th></th><th>reference (PyTorch)</th><th>proofinfer (Rust)</th></tr></thead>
+<tbody>
+<tr><td>forward pass</td><td>batched over the whole sequence</td><td>one token at a time</td></tr>
+<tr><td>attention</td><td><code>scaled_dot_product_attention(is_causal=True)</code></td><td>explicit loop over the KV cache</td></tr>
+<tr><td>RoPE</td><td>precomputed <code>freq_cis</code> table in the file</td><td>computed from <code>theta</code> and <code>pos</code> in <code>ops::rope</code></td></tr>
+<tr><td>GQA heads</td><td><code>torch.repeat_interleave</code></td><td><code>h / kv_mul</code> index division</td></tr>
+<tr><td>weights</td><td><code>f32</code> tensors via <code>numpy</code></td><td><code>f32</code> slices read by a bounds-checked cursor</td></tr>
+</tbody></table>
+
+<p>Two consequences worth spelling out.</p>
+
+<p><strong>RoPE is computed, not read.</strong> The checkpoint file <em>contains</em> a <code>freq_cis</code> table, and reading it would have been easier. But then the differential test would compare two programs sharing a precomputed constant, and a bug in our RoPE would be invisible. Computing it means the test genuinely exercises our angle arithmetic. The loader skips those bytes on purpose.</p>
+
+<p><strong>The tolerance is a statement about summation order, not about the model.</strong> Both sides sum the same products in different orders, and floating-point addition is not associative, so a bitwise comparison would be testing <code>matmul</code>'s inner loop rather than the transformer. Hence <code>1e-4 + 1e-4*|ref|</code>: the absolute term covers logits near zero, where a relative bound is meaningless because the reference itself is working in <code>f32</code> and has no significant digits left, and the relative term covers large logits where accumulated rounding grows with magnitude. For fp16 the relative term would have to be around 1e-2, because fp16 carries about three decimal digits.</p>
+
+<p class="source">Source: <a href="https://github.com/blackdragoon26/proofinfer/blob/main/docs/testing.md">https://github.com/blackdragoon26/proofinfer/blob/main/docs/testing.md</a> in the repository.</p>
+</main>
+
+</body>
+</html>

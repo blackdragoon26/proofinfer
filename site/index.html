@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>proofinfer</title>
+<meta name="description" content="proofinfer — a Llama inference engine in Rust with zero external dependencies, and the evidence that it computes the right thing.">
+<link rel="stylesheet" href="style.css">
+<script src="motion.js" defer></script>
+</head>
+<body>
+<canvas id="bg" aria-hidden="true"></canvas>
+
+<nav>
+  <div class="navlinks">
+    <a href="index.html" class="here">Proof</a>
+    <a href="testing.html">Testing</a>
+    <a href="performance.html">Performance</a>
+    <a href="design.html">Design</a>
+  </div>
+  <div class="navbtns">
+    <a class="btn" href="https://github.com/blackdragoon26/proofinfer">Repository</a>
+    <a class="btn" href="https://sankalpjha.dev/">Sankalp</a>
+  </div>
+</nav>
+
+<main>
+
+  <div class="hero">
+    <h1>proofinfer</h1>
+    <p class="lede">A Llama inference engine in Rust with <strong>zero external
+    dependencies</strong>, built around a claim that is usually made and rarely
+    justified: that it computes the right thing.</p>
+  </div>
+
+  <section>
+    <h2>The work</h2>
+    <p>The engine is the small half. The rest is the evidence:</p>
+    <ul class="work">
+      <li><strong>Differential testing</strong> against the PyTorch reference from
+        <a href="https://github.com/karpathy/llama2.c">llama2.c</a> — six
+        configurations, every logit at every position.</li>
+      <li><strong>Byte-identical output</strong> against <code>run.c</code>, a
+        third independent implementation in C.</li>
+      <li><strong>Mutation testing</strong> on both halves of the suite, so
+        neither the harness nor the tests can be quietly incapable of
+        failing.</li>
+      <li>A <strong>machine-checked Verus proof</strong> of KV-cache index
+        safety.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Results</h2>
+    <div class="rows">
+      <div><span class="k">Differential, 6 configurations</span><span class="v">6/6 &middot; 1.0e-5</span></div>
+      <div><span class="k">Real stories15M weights</span><span class="v">200/200</span></div>
+      <div><span class="k">Greedy output vs run.c</span><span class="v">identical</span></div>
+      <div><span class="k">Mutation: harness &middot; test suite</span><span class="v">10/10 &middot; 21/21</span></div>
+      <div><span class="k">Verus, --no-cheating</span><span class="v">24 verified</span></div>
+      <div><span class="k">Rust tests, debug and release</span><span class="v">75</span></div>
+      <div><span class="k">Throughput, single-threaded</span><span class="v">835 tok/s</span></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Documentation</h2>
+    <ul class="doclist">
+      <li><a href="testing.html">Testing</a> — how correctness is established,
+        and how every check was shown to fail.</li>
+      <li><a href="performance.html">Performance</a> — throughput, the 8-lane
+        dot product, and the gap left by <code>-Ofast</code>.</li>
+      <li><a href="design.html">Design</a> — architecture, the trusted computing
+        base, and what is <em>not</em> verified.</li>
+    </ul>
+  </section>
+
+</main>
+
+<footer>
+  <p>Created by <a href="https://sankalpjha.dev/">Sankalp</a>.</p>
+</footer>
+
+</body>
+</html>

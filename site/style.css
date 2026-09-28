@@ -1,0 +1,251 @@
+/* proofinfer — one stylesheet for the landing page and the doc pages.
+   Black and white, inverted automatically for dark mode. No colours, no
+   dependencies, no build step. */
+
+/* ---------- reset ---------- */
+
+:root { color-scheme: light dark; }
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  padding: 0 1.5rem 5rem;
+  background: #fff;
+  color: #000;
+  font: 16px/1.65 ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Everything else for dark mode is at the foot of this file, where it can
+   outrank the rules it needs to override. */
+@media (prefers-color-scheme: dark) {
+  body { background: #000; color: #fff; }
+}
+
+a { color: inherit; }
+
+a:hover { opacity: 0.55; }
+
+:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }
+
+/* The drifting background sits behind everything and never intercepts clicks. */
+
+#bg {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: -1;
+  pointer-events: none;
+}
+
+/* ---------- navbar ---------- */
+
+nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  max-width: 46rem;
+  margin: 0 auto;
+  padding: 1.1rem 0;
+}
+
+.navlinks { display: flex; gap: 1.1rem; flex-wrap: wrap; }
+
+.navlinks a {
+  font-size: 0.82rem;
+  letter-spacing: 0.02em;
+  text-decoration: none;
+  opacity: 0.55;
+}
+
+.navlinks a:hover { opacity: 1; }
+
+/* The page you are on. */
+.navlinks a.here { opacity: 1; font-weight: 600; }
+
+.navbtns { display: flex; gap: 0.5rem; }
+
+.btn {
+  display: inline-block;
+  padding: 0.3rem 0.75rem;
+  border: 1px solid #ccc;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: opacity 0.15s ease, border-color 0.15s ease;
+}
+
+.btn:hover { opacity: 1; border-color: currentColor; }
+
+/* ---------- shared page frame ---------- */
+
+main, footer {
+  max-width: 46rem;
+  margin: 0 auto;
+}
+
+.lede {
+  font-size: 1.05rem;
+  max-width: 34rem;
+  opacity: 0.75;
+}
+
+/* ---------- landing page ---------- */
+
+.hero { padding: 3.5rem 0 2.5rem; }
+
+section { margin: 0 0 2.75rem; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875em;
+}
+
+h1 {
+  font-size: clamp(2.6rem, 9vw, 4rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+  margin: 0 0 1rem;
+  font-weight: 600;
+}
+
+h2 {
+  font-size: 0.78rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  opacity: 0.45;
+  margin: 3.5rem 0 1.25rem;
+  font-weight: 600;
+}
+
+.work, .doclist { margin: 0; padding-left: 1.1rem; }
+
+.work li, .doclist li { margin-bottom: 0.6rem; max-width: 38rem; }
+
+.rows { border-top: 1px solid #e5e5e5; }
+
+@media (prefers-color-scheme: dark) { .rows { border-color: #222; } }
+
+.rows > div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1.5rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid #e5e5e5;
+}
+
+@media (prefers-color-scheme: dark) { .rows > div { border-color: #222; } }
+
+.rows .k { opacity: 0.7; }
+
+.rows .v {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  text-align: right;
+  white-space: nowrap;
+}
+
+footer {
+  margin-top: 4.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid #e5e5e5;
+  font-size: 0.82rem;
+  opacity: 0.6;
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+@media (prefers-color-scheme: dark) { footer { border-color: #222; } }
+
+/* ---------- doc pages ---------- */
+
+.doc { padding-bottom: 1rem; }
+
+.doc h1 {
+  font-size: clamp(2rem, 6vw, 2.6rem);
+  margin: 1.5rem 0 2rem;
+}
+
+.doc h3 { font-size: 1.05rem; margin: 2.25rem 0 0.6rem; font-weight: 600; }
+.doc h4 { font-size: 0.95rem; margin: 1.75rem 0 0.5rem; font-weight: 600; opacity: 0.8; }
+
+.doc p { max-width: 40rem; }
+
+.doc ul, .doc ol { max-width: 38rem; padding-left: 1.2rem; }
+.doc li { margin-bottom: 0.5rem; }
+
+.doc code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.87em;
+  background: #f4f4f4;
+  padding: 0.1em 0.32em;
+  border-radius: 3px;
+}
+
+.doc pre {
+  background: #f7f7f7;
+  border: 1px solid #e5e5e5;
+  border-radius: 4px;
+  padding: 0.9rem 1rem;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.doc pre code { background: none; padding: 0; font-size: inherit; }
+
+.doc table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+  font-size: 0.88rem;
+}
+
+.doc th, .doc td {
+  border: 1px solid #e5e5e5;
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.doc th { font-weight: 600; background: #f7f7f7; }
+
+@media (prefers-color-scheme: dark) {
+  .doc th, .doc td { border-color: #222; }
+}
+
+.source {
+  margin-top: 3.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid #e5e5e5;
+  font-size: 0.8rem;
+  opacity: 0.6;
+  word-break: break-all;
+}
+
+@media (prefers-color-scheme: dark) { .source { border-color: #222; } }
+
+/* ---------- dark mode, last ----------
+ *
+ * These have to come after the rules they override. A bare `th` selector loses
+ * to `.doc th` on specificity, and a media query near the top of the file
+ * loses to any plain rule declared below it - which is how the table headers
+ * and code spans ended up light-on-light and unreadable in dark mode.
+ */
+
+@media (prefers-color-scheme: dark) {
+  .doc th { background: #0d0d0d; color: #fff; }
+  .doc code { background: #1a1a1a; color: #fff; }
+  .doc pre { background: #0a0a0a; border-color: #262626; }
+  .doc pre code { background: none; }
+  .btn { border-color: #3a3a3a; }
+}
