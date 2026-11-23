@@ -256,7 +256,9 @@ Everything above those is tested; those are assumed and stated.
    mutation check.)
 7. What would you verify first in Verus or Lean, and what is the property?
    (Index safety of the KV-cache slicing in `forward` for any `pos < seq_len`.)
-   This one is no longer hypothetical: `verus/` proves it, 24 conditions, all
+   This one is no longer hypothetical: `verus/` proves it (plus `State::new`'s
+   checked cache-size guard, the composed `forward -> attention` layer-slice
+   handoff, and parametric `Weights::layer` bounds) — 36 conditions, all
    discharged by Verus under `--no-cheating`. What it does *not* do is verify
    the crate. It is a model of the indexing arithmetic whose correspondence to
    `src/ops.rs` and `src/model.rs` is a human transcription, and a refactor

@@ -1,20 +1,18 @@
-# KV-cache index safety in Verus
+# KV-cache and weight-slice index safety in Verus
 
 This directory holds a machine-checked proof of the property named in
-CONTEXT.md section 10, question 7:
+CONTEXT.md section 10, question 7: **KV-cache and attention indexing never goes
+out of bounds for any `pos < seq_len`**, extended to cover `State::new`'s
+checked cache-length arithmetic and parametric `Weights::layer` slicing.
 
-> KV-cache and attention indexing never goes out of bounds for any
-> `pos < seq_len`.
-
-- `kv_cache_bounds.rs` — the Verus development. **24 verification conditions,
-  all discharged by Verus.** See "Verification status" below for the exact
-  command and its real output.
-- `check_citations.py` — bidirectional, symbol-scoped citation verifier tying
-  this document and `kv_cache_bounds.rs` to `src/ops.rs` and `src/model.rs`.
-- This file — what is proved, where it lands in the Rust source, what is
+- [kv_cache_bounds.rs](kv_cache_bounds.rs) — the Verus development. **36
+  verification conditions, all discharged by Verus under `--no-cheating`.** See
+  "Verification status" below for the exact command and its real output.
+- [check_citations.py](check_citations.py) — bidirectional, symbol-scoped
+  citation verifier tying this document and `kv_cache_bounds.rs` to
+  `src/ops.rs` and `src/model.rs`.
+- This page — what is proved, where it lands in the Rust source, what is
   *not* proved, and how to re-run the check.
-
----
 
 ## 1. The property, precisely
 
@@ -28,13 +26,18 @@ integers, and `kv_dim = head_size * n_kv_heads` and
 actually performs: `n_layers > 0`, `n_heads > 0`, `n_kv_heads > 0`,
 `seq_len > 0`, `head_size > 0`, and `n_heads % n_kv_heads == 0`.
 
-**Claim 1 — the shapes follow from the loader.**
+**Claim 1 — the shapes and checked cache bounds follow from the loader and `State::new`.**
 `lemma_shapes_from_config` shows that anything passing
 `model.rs::Config::validate` and `ops.rs::AttentionDims::try_new` yields a
 shape tuple satisfying the preconditions above. The only non-obvious part is
 `head_size > 0`, which the loader never checks explicitly: it computes
 `head_size = dim / n_heads` only after rejecting `dim == 0` and
 `dim % n_heads != 0`, and a divisor of a positive number is positive.
+`lemma_kv_dim_le_dim` proves `head_size * n_kv_heads <= dim <= usize::MAX` from
+those same checks, and `exec_checked_cache_len` proves that `model.rs::State::new`'s
+`checked_mul` chain plus `isize::MAX` byte-capacity bound guarantees
+`seq_len * kv_dim <= usize::MAX`, `n_layers * (seq_len * kv_dim) <= usize::MAX`,
+and `cache * 4 <= isize::MAX`.
 
 **Claim 2 — the attention read is in bounds** (`lemma_attention_row_in_layer`).
 For every `t` with `0 <= t <= pos` and every `kv` with `kv < n_kv_heads`:
@@ -62,14 +65,27 @@ The second is what makes the attention read immediately afterwards observe the
 value just written. Supporting fact: `lemma_layer_slice_in_cache`, the
 per-layer slice `[l*stride, l*stride + stride)` is inside the whole cache.
 
-**Claim 4 — the composition** (`lemma_attention_row_in_cache`) is the same
-bound with the layer offset folded in, which is the form the CONTEXT.md
-question is phrased in.
+**Claim 4 — end-to-end `forward` to `attention` composition**
+(`lemma_attention_row_in_cache` and `exec_forward_cache_write_and_layer_slice`).
+At the proof level, `lemma_attention_row_in_cache` folds the layer offset into
+the attention bound. At the executable Rust level,
+`exec_forward_cache_write_and_layer_slice` slices
+`&key_cache[layer_start..layer_end]` and `&value_cache[layer_start..layer_end]`
+and passes them directly into `exec_attention_read`, so Verus machine-checks
+that the per-layer slice satisfies `attention`'s preconditions.
 
-**Claim 5 — the remaining index expressions.**
+**Claim 5 — the remaining attention scratch slices.**
 `lemma_query_head_in_q` (`&q[h*head_size..(h+1)*head_size]` and
 `&mut out[h*head_size..(h+1)*head_size]` in `ops.rs::attention`) and
 `lemma_scores_window_in_scratch` (`&mut scores[..limit]` in `ops.rs::attention`).
+
+**Claim 6 — parametric per-layer weight slicing** (`lemma_layer_tensor_slice`
+and `exec_weight_layer_slice`).
+For any per-layer weight tensor of length `n_layers * per_layer` and any layer
+`l < n_layers`, `model.rs::Weights::layer`'s slice
+`&buf[start..start + per_layer]` (where `start = l * per_layer`) is non-empty,
+overflow-free, and in bounds. This covers all nine per-layer weight accessors
+(`rms_att`, `rms_ffn`, `wq`, `wk`, `wv`, `wo`, `w1`, `w2`, `w3`) uniformly.
 
 ## 2. Where each claim lands in the Rust source
 
@@ -86,22 +102,22 @@ bidirectionally against both `src/` and `verus/kv_cache_bounds.rs` by
 | `ops.rs::attention` | `let kv = h / kv_mul` | `lemma_gqa_head_in_range`, `exec_attention_read` |
 | `ops.rs::attention` | `let limit = pos + 1` | `lemma_limit_rows_fit_in_layer`, `exec_attention_read` |
 | `ops.rs::attention` | `debug_assert!`s on buffer lengths | the `requires` of `exec_attention_read` |
-| `ops.rs::AttentionDims::kv_dim` / `ops.rs::AttentionDims::kv_mul` / `ops.rs::AttentionDims::q_dim` | `kv_dim` / `kv_mul` / `q_dim` | `Shapes::kv_dim`, `kv_mul`, `q_dim` |
-| `ops.rs::AttentionDims::try_new` | shape validation checks | `Shapes::valid`, `lemma_shapes_from_config` |
+| `ops.rs::AttentionDims::kv_dim` / `ops.rs::AttentionDims::kv_mul` / `ops.rs::AttentionDims::q_dim` | `kv_dim` / `kv_mul` / `q_dim` | `Shapes::kv_dim`, `kv_mul`, `q_dim`, `lemma_kv_dim_le_dim` |
+| `ops.rs::AttentionDims::try_new` | shape validation checks | `Shapes::valid`, `lemma_shapes_from_config`, `lemma_kv_dim_le_dim` |
 | `model.rs::Config::validate` | non-zero config checks + `attention_dims()` | `Shapes::valid`, `lemma_shapes_from_config` |
+| `model.rs::Weights::layer` | `let start = l * per_layer; &buf[start..start + per_layer]` | `lemma_layer_tensor_slice`, `exec_weight_layer_slice` |
+| `model.rs::State::new` | `checked_mul` cache size and `try_zeroed_f32_vec` byte-capacity bound | `exec_checked_cache_len` |
 | `model.rs::State::forward` | `let kv_layer_stride = cfg.seq_len * kv_dim` | `Shapes::kv_layer_stride`, `exec_forward_cache_write_and_layer_slice` |
 | `model.rs::State::forward` | `let base = l*stride + pos*kv_dim; key_cache/value_cache[base..base+kv_dim]` | `lemma_cache_write_in_cache`, `exec_forward_cache_write_and_layer_slice` |
-| `model.rs::State::forward` | `layer_start`/`layer_end`, `&self.key_cache[layer_start..layer_end]` / `&self.value_cache[layer_start..layer_end]` | `lemma_layer_slice_in_cache`, `exec_forward_cache_write_and_layer_slice` |
+| `model.rs::State::forward` | `layer_start`/`layer_end`, `&self.key_cache[layer_start..layer_end]` / `&self.value_cache[layer_start..layer_end]` passed to `attention` | `lemma_layer_slice_in_cache`, `exec_forward_cache_write_and_layer_slice` calling `exec_attention_read` |
 | `model.rs::State::forward` | `if pos >= cfg.seq_len { return Err(..) }` | the `pos < seq_len` hypothesis everywhere |
-| `model.rs::State::new` | `checked_mul` cache size and `try_zeroed_f32_vec` allocations | the overflow preconditions of the `exec fn`s |
 
-Section 7 of `kv_cache_bounds.rs` goes one step further: `exec_attention_read`
-and `exec_forward_cache_write_and_layer_slice` are `exec fn`s containing the
-index expressions **copied verbatim** from the table above, operating on real
-`Vec<f32>`. Verus discharges the genuine slice-indexing obligations there,
-including its implicit no-overflow check on the index arithmetic. So the
-arithmetic above is not just asserted about strings of symbols: the same
-expressions are accepted by the verifier as real Rust slicing.
+Section 7 of `kv_cache_bounds.rs` contains executable `exec fn`s with the index
+expressions **copied verbatim** from the table above, operating on real
+`&Vec<f32>` and `&[f32]` slices. Verus discharges the genuine slice-indexing
+obligations there, including its implicit no-overflow check on the index
+arithmetic and the cross-function slice handoff from `forward` into
+`attention`.
 
 ## 3. What is inside the lemma, and what is not
 
@@ -109,8 +125,15 @@ expressions are accepted by the verifier as real Rust slicing.
 
 - The bounds of every KV-cache index expression, for all shapes satisfying the
   structural preconditions and all `pos < seq_len`.
-- That those structural preconditions follow from the conditions the loader
-  checks (transcribed by hand — see below).
+- That those structural preconditions and `kv_dim <= dim <= usize::MAX` follow
+  from the conditions the loader checks (transcribed by hand — see below).
+- That `State::new`'s `checked_mul` + `isize::MAX` byte-capacity guard prevents
+  `usize` and allocation-size overflow for the KV cache (`exec_checked_cache_len`).
+- That the composed `forward -> attention` slice handoff satisfies `attention`'s
+  buffer-length preconditions (`exec_forward_cache_write_and_layer_slice`
+  calling `exec_attention_read` directly on `&[f32]` layer slices).
+- That `Weights::layer`'s slice `&buf[start..start + per_layer]` is in bounds
+  and overflow-free for all `l < n_layers` (`exec_weight_layer_slice`).
 - That the GQA head mapping `h / kv_mul` lands inside `0..n_kv_heads`.
 - That the index arithmetic cannot overflow `usize`, both via Verus's own
   no-overflow check on the real slices and via the explicit
@@ -122,57 +145,54 @@ claiming otherwise.**
 1. **This is not a verification of the crate.** `src/ops.rs` and
    `src/model.rs` contain no `verus!` macro and are not compiled by Verus. The
    development is a *separate model file*. To verify the crate itself you would
-   need `vargo` and to annotate the real functions; that was not attempted.
+   need `vargo` and to annotate the real functions; that was not attempted so
+   the crate keeps zero external dependencies and Rust 1.70.0 MSRV.
 2. **The correspondence between the model and the code is manual, bounded by
    a syntactic citation check.** The `Shapes` preconditions and the `exec fn`
-   bodies were transcribed by a human. If someone changed the control flow or
-   context around an expression without changing the cited text, **this file
-   would keep verifying.** This is the single most important caveat: the proof
-   is a proof *about a transcription*.
-
-   `verus/check_citations.py` closes the syntactic drift mode on *both* sides:
-   it tokenizes Rust code (skipping `//` and nested `/* ... */` comments,
-   treating string literals as atomic tokens so string text cannot satisfy a
-   code check, and matching on full token boundaries), resolves each symbol
-   cited in this file and in `kv_cache_bounds.rs`, asserts every required token
-   sequence (including full lower and upper slice bounds and `checked_mul`
-   chains) appears in `src/` and in the paired `exec_*` body in
-   `verus/kv_cache_bounds.rs`, and runs `--self-test` in CI to prove mutations
-   on either side fail. What that check does *not* do is verify semantic
-   equivalence across un-cited code: an edit that preserves a cited expression's
-   tokens while altering how variables are initialized elsewhere, or a gap in
-   which expressions were transcribed at all, would still pass.
-3. **The loader's `checked_mul` is assumed, not proved.** The overflow
-   preconditions in the `exec fn`s (`head_size * n_kv_heads <= usize::MAX`,
-   `(n_layers * seq_len) * (head_size * n_kv_heads) <= usize::MAX`,
-   `model.rs::State::new`) are taken as `requires`. Nothing here shows that
-   `model.rs::checked_tensor_len` or `model.rs::State::new` really do return
-   `Err` rather than wrap.
+   bodies were transcribed by a human. `verus/check_citations.py` closes the
+   syntactic drift mode on *both* sides: it tokenizes Rust code (skipping `//`
+   and nested `/* ... */` comments, treating string literals as atomic tokens
+   so string text cannot satisfy a code check, and matching on full token
+   boundaries), resolves each symbol cited in this file and in
+   `kv_cache_bounds.rs`, asserts every required token sequence (including full
+   lower and upper slice bounds, `checked_mul` chains, `Weights::layer`, and
+   the composed `exec_attention_read` call) appears in `src/` and in the paired
+   `exec_*` body in `verus/kv_cache_bounds.rs`, and runs `--self-test` in CI to
+   prove mutations on either side fail. What that check does *not* do is verify
+   semantic equivalence across un-cited code: an edit that preserves a cited
+   expression's tokens while altering how variables are initialized elsewhere
+   would still pass.
+3. **Checkpoint tensor-table `try_fold` arithmetic is still assumed.**
+   `State::new`'s `checked_mul` + `isize::MAX` byte-capacity check and
+   `kv_dim <= dim` are now proved (`exec_checked_cache_len`,
+   `lemma_kv_dim_le_dim`), but `model.rs::checked_tensor_len`'s iterator
+   `try_fold` used while loading checkpoint weight tensors is not modelled in
+   Verus; `exec_weight_layer_slice` takes `buf.len() == n_layers * per_layer`
+   and `n_layers * per_layer <= usize::MAX` as `requires`.
 4. **The `pos < seq_len` guard is assumed, not proved.**
    `model.rs::State::forward`'s guard is read as a precondition of `forward`,
    and the proof is conditional on it.
 5. **The `debug_assert!`s in `ops.rs::attention` are compiled out in release.**
    They are *not* what makes the code safe. The safety argument is the
-   arithmetic in `lemma_limit_rows_fit_in_layer` plus
-   `lemma_layer_slice_in_cache`: a layer slice is `seq_len * kv_dim` long, and
-   `pos < seq_len` makes `pos + 1` rows fit. That argument is real, but it is
-   carried out against the model, so the connection to the real call site is
-   one of the manual correspondences in point 2.
+   composed arithmetic across `exec_forward_cache_write_and_layer_slice` and
+   `exec_attention_read`: a layer slice is `seq_len * kv_dim` long, and
+   `pos < seq_len` makes `pos + 1` rows fit. That argument is machine-checked
+   on the model, while the connection to the compiled `src/` call site remains
+   bounded by point 2.
 6. **No float semantics whatsoever.** `dot`, `rmsnorm`, `rope`, `softmax`,
    `silu`, `matmul` and the eight-accumulator reduction are not modelled, not
    reasoned about, and not verified. `attention`'s arithmetic is treated as
    irrelevant to index safety, which it is, but that is a modelling decision,
    not a proof.
-7. **The composition across the `forward` -> `attention` boundary is manual.**
-   `exec_attention_read` and `exec_forward_cache_write_and_layer_slice` are two
-   separate functions with separate `requires`. Nothing machine-checks that the
-   slice `forward` passes satisfies `attention`'s precondition; that is
-   `lemma_attention_row_in_layer` at the model level plus the manual
-   correspondence.
-8. **`out` and `scores` are modelled as `&Vec<f32>`, not `&mut Vec<f32>`.** The
-   real signature is `&mut`. Writing to them cannot affect whether an index is
-   in bounds, and Verus correctly refuses to carry `v.len()` across a loop
-   iteration for a `&mut`, but the mutability is genuinely dropped rather than
+7. **`forward -> attention` composition (closed).** Previously listed as an
+   open manual step; `exec_forward_cache_write_and_layer_slice` now passes
+   `&key_cache[layer_start..layer_end]` and `&value_cache[layer_start..layer_end]`
+   directly into `exec_attention_read`, so Verus discharges the cross-function
+   slice precondition directly.
+8. **`out` and `scores` are modelled as `&[f32]`, not `&mut [f32]`.** The real
+   signature is `&mut [f32]`. Writing to them cannot affect whether an index is
+   in bounds, and Verus correctly refuses to carry `s.len()` across a loop
+   iteration for a `&mut`, so mutability is genuinely dropped rather than
    proved irrelevant.
 9. **Bounds safety does not catch wrong-but-in-bounds bugs.** Mutant #3
    (`h / kv_mul` -> `h % n_kv_heads`) is also in range and would sail through
@@ -198,8 +218,7 @@ a prebuilt release; `cargo install vargo` is **not** needed.
 # 1. Prebuilt Verus for Linux/x86_64 (~485 MB).
 curl -fSL -o verus-x86-linux.zip \
   'https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip'
-echo '7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus-x86-linux.zip' \
-  | sha256sum --check --strict -
+echo '7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus-x86-linux.zip' | sha256sum --check --strict -
 unzip -q verus-x86-linux.zip -d verus-dist
 
 # 2. Verus requires a matching rustc (1.98.1 for this release).
@@ -219,8 +238,7 @@ RUSTUP_HOME="$PWD/.verus-rustup" ./verus-dist/verus-x86-linux/verus \
 # 1. Prebuilt Verus for macOS/arm64 (449 MB).
 curl -fSL -o verus-arm64-macos.zip \
   'https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-arm64-macos.zip'
-echo '3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc  verus-arm64-macos.zip' \
-  | shasum -a 256 --check -
+echo '3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc  verus-arm64-macos.zip' | shasum -a 256 --check -
 unzip -q verus-arm64-macos.zip -d verus-dist
 
 # 2. Install the matching rustc into an isolated RUSTUP_HOME:
@@ -251,7 +269,7 @@ Verus
   Toolchain: 1.98.1-x86_64-unknown-linux-gnu
 
 $ verus --crate-type lib --no-cheating verus/kv_cache_bounds.rs
-verification results:: 24 verified, 0 errors
+verification results:: 36 verified, 0 errors
 $ echo $?
 0
 ```
@@ -262,18 +280,20 @@ $ echo $?
   `3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc`).
 - rustc `1.98.1`, installed into an isolated `RUSTUP_HOME`. No `vargo`, no
   `cargo install`, nothing added to `Cargo.toml` or `Cargo.lock`.
-- `verus/check_citations.py --self-test` and `verus/check_citations.py` both
-  pass, verifying symbol-scoped expressions across both `src/` and
-  `verus/kv_cache_bounds.rs`.
+- Wall clock for the verification itself: ~3.9 s on x86_64 Linux.
+- `verus/check_citations.py --self-test` (9/9 mutations rejected) and
+  `verus/check_citations.py` (11 symbol-scoped bidirectional citations) both
+  pass across `src/` and `verus/kv_cache_bounds.rs`.
 - `grep` finds no `assume`, `admit`, or `external_body` in the file, and
   `--no-cheating` passes, which is the stronger of the two claims.
 
-**What "verified" means here, and what it does not.** 24 verification
-conditions passed, covering the five claims in section 1. That is a proof about
+**What "verified" means here, and what it does not.** 36 verification
+conditions passed, covering the six claims in section 1. That is a proof about
 the model in `kv_cache_bounds.rs` and about the real slice expressions
 transcribed into its section 7. It is not a proof about the compiled
 `src/ops.rs` or `src/model.rs`, and section 3 lists what that excludes. The
-honest one-line summary: **the indexing arithmetic is machine-checked by Verus,
-and `verus/check_citations.py` checks that every cited `src/` and `exec_*`
-expression still matches textually; semantic equivalence across un-cited code
-remains a manual correspondence.**
+honest one-line summary: **the indexing arithmetic, checked cache-size guard,
+`forward -> attention` slice composition, and `Weights::layer` bounds are
+machine-checked by Verus, and `verus/check_citations.py` checks that every
+cited `src/` and `exec_*` expression still matches textually; semantic
+equivalence across un-cited code remains a manual correspondence.**

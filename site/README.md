@@ -2,7 +2,7 @@
 
 **Live at <https://proofinfer.vercel.app>.**
 
-The site for this project, living in the repository at `site/`. Four pages, one
+The site for this project, living in the repository at `site/`. Five pages, one
 stylesheet, one small script. No framework, no build step, no dependencies. Open
 it directly or serve the folder; it works either way.
 
@@ -16,25 +16,28 @@ python3 -m http.server 8000   # then http://localhost:8000
 
 | file | what it is |
 |---|---|
-| `index.html` | the landing page — the only hand-written page |
+| `index.html` | the landing page — hand-written body, synced `<nav>` markers |
+| `proof.html` | **generated** from `../verus/README.md` |
 | `testing.html`, `performance.html`, `design.html` | **generated** from `../docs/` |
-| `style.css` | one stylesheet for all four pages |
+| `style.css` | one stylesheet for all five pages |
 | `motion.js` | the drifting background |
-| `sync.py` | the generator for the three doc pages |
+| `sync.py` | the generator for the four doc pages + `index.html` `<nav>` |
 | `check_docs.py`, `check_light.py`, `motion_test.js` | the checks below |
 
 ## The doc pages are generated, not written
 
-`testing.html`, `performance.html` and `design.html` are rendered from the
-markdown in `../docs/` by `sync.py`. Each page links back to the markdown it came
-from, so the site and the docs cannot quietly disagree about what the project
-claims.
+`proof.html` is rendered from `../verus/README.md`, and `testing.html`,
+`performance.html` and `design.html` are rendered from the markdown in
+`../docs/` by `sync.py`. Each page links back to the markdown it came from, and
+`sync.py` also keeps the `<nav>` block inside `index.html` synced via
+`<!-- NAV:START -->` / `<!-- NAV:END -->` markers so the site and the docs
+cannot quietly disagree about what the project claims.
 
-After changing anything in `../docs/`:
+After changing anything in `../verus/README.md` or `../docs/`:
 
 ```sh
-python3 sync.py           # regenerate the three pages
-python3 sync.py --check   # exit 1 if the committed HTML is stale
+python3 site/sync.py           # regenerate the four pages + index.html nav
+python3 site/sync.py --check   # exit 1 if any committed HTML is stale
 ```
 
 `sync.py` is not a general Markdown implementation, and does not need to be.

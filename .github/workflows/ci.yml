@@ -375,7 +375,7 @@ jobs:
             "$bin" --version
           fi
 
-      # --no-cheating rejects assume, admit and external_body, so "24 verified,
+      # --no-cheating rejects assume, admit and external_body, so "36 verified,
       # 0 errors" is a claim about the file rather than a comment in it.
       - name: Verify the KV-cache index-safety proof
         run: |

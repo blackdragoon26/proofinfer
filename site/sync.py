@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Render the project's docs/ as HTML pages for the landing site.
+"""Render the project's docs and proof README as HTML pages for the landing site.
 
-The site's `docs/*.html` are generated from the markdown in the project's
-repository, so the two cannot say different things. Run this after any change to
-the project's docs; it reports if the committed HTML is out of date.
+The site's generated HTML pages come directly from the markdown in the
+repository (`verus/README.md` and `docs/*.md`), and the navbar inside
+`site/index.html` is kept in sync via `<!-- NAV:START -->` / `<!-- NAV:END -->`
+markers so the site and the repository cannot quietly say different things.
 
-    python3 sync.py            # regenerate docs/*.html
-    python3 sync.py --check    # exit 1 if the committed HTML is stale
+    python3 sync.py            # regenerate HTML pages and index.html nav
+    python3 sync.py --check    # exit 1 if any committed HTML is stale
 
 Deliberately not a general Markdown implementation. These docs use headings,
 fenced code, pipe tables, bullet and numbered lists, bold, inline code and
@@ -31,20 +32,26 @@ from pathlib import Path
 SITE = Path(__file__).resolve().parent
 REPO = SITE.parent
 GITHUB = "https://github.com/blackdragoon26/proofinfer"
-BLOB = f"{GITHUB}/blob/main/docs"
+BLOB = f"{GITHUB}/blob/main"
 
+# Repo-relative markdown source path, output filename in site/, page title.
 PAGES = [
-    ("testing.md", "testing.html", "Testing"),
-    ("performance.md", "performance.html", "Performance"),
-    ("design.md", "design.html", "Design"),
+    ("verus/README.md", "proof.html", "Proof"),
+    ("docs/testing.md", "testing.html", "Testing"),
+    ("docs/performance.md", "performance.html", "Performance"),
+    ("docs/design.md", "design.html", "Design"),
 ]
 
 NAV = [
-    ("Proof", "index.html"),
+    ("Overview", "index.html"),
+    ("Proof", "proof.html"),
     ("Testing", "testing.html"),
     ("Performance", "performance.html"),
     ("Design", "design.html"),
 ]
+
+NAV_START = "<!-- NAV:START -->"
+NAV_END = "<!-- NAV:END -->"
 
 # Guards: the converter must never emit a construct it failed to understand,
 # because a literal "**" in the output is a visible bug.
@@ -88,7 +95,7 @@ def split_row(line: str) -> list[str]:
     return [c.replace(r"\|", "|").strip() for c in re.split(r"(?<!\\)\|", body)]
 
 
-def inline(text: str) -> str:
+def inline(text: str, base_dir: str = "docs") -> str:
     """Apply inline markup to one run of text.
 
     Code spans are lifted out first, so a `**`, a `[` or a `<` inside one is
@@ -113,10 +120,9 @@ def inline(text: str) -> str:
             href = esc(url)
         else:
             # A link in a doc is relative to that doc's own folder, so
-            # "performance.md" is docs/performance.md and "../README.md" is
-            # the README at the repository root. Normalising against a "docs"
-            # base gets both right; joining onto the repo root gets neither.
-            path = posixpath.normpath(posixpath.join("docs", url))
+            # "performance.md" in docs/ is docs/performance.md, "kv_cache_bounds.rs"
+            # in verus/ is verus/kv_cache_bounds.rs, and "../README.md" is README.md.
+            path = posixpath.normpath(posixpath.join(base_dir, url))
             href = f"{GITHUB}/blob/main/{esc(path)}"
         return f'<a href="{href}">{label}</a>'
 
@@ -129,7 +135,7 @@ def inline(text: str) -> str:
     return text
 
 
-def convert(md: str) -> str:
+def convert(md: str, base_dir: str = "docs") -> str:
     # Drop HTML comments from the source. Each doc opens with one explaining how
     # it was split out of the README; rendered as text it reads as a stray line
     # above the title.
@@ -169,12 +175,12 @@ def convert(md: str) -> str:
             out.append("<table>")
             out.append(
                 "<thead><tr>"
-                + "".join(f"<th>{inline(c)}</th>" for c in head)
+                + "".join(f"<th>{inline(c, base_dir)}</th>" for c in head)
                 + "</tr></thead>"
             )
             out.append("<tbody>")
             for r in rows:
-                out.append("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in r) + "</tr>")
+                out.append("<tr>" + "".join(f"<td>{inline(c, base_dir)}</td>" for c in r) + "</tr>")
             out.append("</tbody></table>")
             out.append("")
             continue
@@ -183,7 +189,7 @@ def convert(md: str) -> str:
         m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if m:
             level = len(m.group(1))
-            out.append(f"<h{level}>{inline(m.group(2))}</h{level}>")
+            out.append(f"<h{level}>{inline(m.group(2), base_dir)}</h{level}>")
             i += 1
             continue
 
@@ -215,7 +221,7 @@ def convert(md: str) -> str:
                 ):
                     item += " " + lines[i].strip()
                     i += 1
-                out.append(f"<li>{inline(item)}</li>")
+                out.append(f"<li>{inline(item, base_dir)}</li>")
             out.append(f"</{tag}>")
             out.append("")
             continue
@@ -238,7 +244,7 @@ def convert(md: str) -> str:
                 break
             buf.append(nxt.strip())
             i += 1
-        out.append(f"<p>{inline(' '.join(buf))}</p>")
+        out.append(f"<p>{inline(' '.join(buf), base_dir)}</p>")
         out.append("")
 
     return "\n".join(out).strip()
@@ -288,7 +294,22 @@ def nav_html(current: str) -> str:
     )
 
 
+def sync_index_nav(index_text: str) -> str:
+    """Replace the marked `<nav>` block inside `site/index.html`."""
+    pattern = re.compile(
+        rf"{re.escape(NAV_START)}.*?{re.escape(NAV_END)}",
+        flags=re.S,
+    )
+    if not pattern.search(index_text):
+        raise ValueError(
+            f"site/index.html is missing {NAV_START} ... {NAV_END} markers"
+        )
+    replacement = f"{NAV_START}\n<nav>\n{nav_html('index.html')}\n</nav>\n{NAV_END}"
+    return pattern.sub(replacement, index_text, count=1)
+
+
 DESCRIPTIONS = {
+    "proof.html": "machine-checked Verus proof of KV-cache and weight-slice index safety, and its explicit limits",
     "testing.html": "how correctness is established, and how every check was shown to fail",
     "performance.html": "throughput, the 8-lane dot product, and the gap left by -Ofast",
     "design.html": "architecture, decisions, trusted computing base, and what is not verified",
@@ -301,18 +322,19 @@ def main() -> int:
     args = ap.parse_args()
 
     stale = []
-    for md_name, html_name, title in PAGES:
-        src = REPO / "docs" / md_name
+    for rel_md, html_name, title in PAGES:
+        src = REPO / rel_md
         if not src.exists():
             print(f"error: {src} not found", file=sys.stderr)
             return 2
         raw = src.read_text()
-        body = convert(raw)
+        base_dir = posixpath.dirname(rel_md)
+        body = convert(raw, base_dir=base_dir)
 
         left = UNCONVERTED.search(body)
         if left:
             print(
-                f"error: {md_name} produced unconverted markup near "
+                f"error: {rel_md} produced unconverted markup near "
                 f"{body[left.start():left.start()+40]!r}",
                 file=sys.stderr,
             )
@@ -323,7 +345,7 @@ def main() -> int:
             desc=DESCRIPTIONS[html_name],
             nav=nav_html(html_name),
             body=body,
-            src=f"{BLOB}/{md_name}",
+            src=f"{BLOB}/{rel_md}",
         )
         out = SITE / html_name
         if args.check:
@@ -333,11 +355,29 @@ def main() -> int:
             out.write_text(page)
             print(f"  wrote {html_name}  ({len(page.splitlines())} lines)")
 
+    index_path = SITE / "index.html"
+    if not index_path.exists():
+        print(f"error: {index_path} not found", file=sys.stderr)
+        return 2
+    old_index = index_path.read_text()
+    try:
+        new_index = sync_index_nav(old_index)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    if args.check:
+        if old_index != new_index:
+            stale.append("index.html")
+    else:
+        if old_index != new_index:
+            index_path.write_text(new_index)
+            print("  updated nav in index.html")
+
     if args.check:
         if stale:
-            print("stale (run: python3 sync.py): " + ", ".join(stale), file=sys.stderr)
+            print("stale (run: python3 site/sync.py): " + ", ".join(stale), file=sys.stderr)
             return 1
-        print("  docs/*.html are up to date with the repository's docs/")
+        print("  site HTML pages and index.html nav are up to date")
     return 0
 
 

@@ -32,8 +32,9 @@ proofinfer/
     check_provenance.py      verifies vendored llama2c sha256s + byte sizes
     requirements.txt         pinned CPU PyTorch/numpy CI dependencies
     llama2c/                 vendored UNMODIFIED from karpathy/llama2.c (MIT)
-  verus/                     Verus proof of KV-cache index safety (24 conditions,
-                             machine-checked; see its README for the scope)
+  verus/                     Verus proof of KV-cache and weight-layer index
+                             safety (36 conditions, machine-checked; rendered
+                             to site/proof.html; see its README for the scope)
                              plus check_citations.py, which checks symbol-scoped
                              expressions across both src/ and verus/
   .github/workflows/ci.yml   six jobs, no `|| true`, no continue-on-error
@@ -103,16 +104,22 @@ index computed in `ops::attention` and `State::forward` is in bounds.
 
 `verus/` contains a Verus development for exactly that, and it is
 **machine-checked**: Verus `0.2026.09.20.aef82ed` reports
-`24 verified, 0 errors` under `--no-cheating`, which rejects `assume`, `admit`
-and `external_body` outright. That is a real run, not a claim.
+`36 verified, 0 errors` under `--no-cheating`, which rejects `assume`, `admit`
+and `external_body` outright. That is a real run, not a claim. The full proof
+write-up is rendered directly from `verus/README.md` to `site/proof.html`.
 
 What is proved: the bounds of every KV-cache index expression for all shapes
 satisfying the loader's structural preconditions and all `pos < seq_len`; that
-those preconditions follow from the checks the loader actually performs; that
-the GQA mapping `h / kv_mul` lands in `0..n_kv_heads`; and that the index
-arithmetic cannot overflow `usize`. The real slice expressions are transcribed
-into `exec fn`s operating on actual `Vec<f32>`, so Verus discharges genuine
-slice-indexing obligations rather than assertions about symbolic expressions.
+those preconditions and `kv_dim <= dim <= usize::MAX` follow from the checks
+the loader actually performs; that `State::new`'s `checked_mul` and
+`isize::MAX` byte-capacity guard prevent cache-length overflow; that the
+composed `forward -> attention` layer-slice handoff satisfies `attention`'s
+preconditions; that `Weights::layer` is in bounds and overflow-free across all
+per-layer weight tensors; that the GQA mapping `h / kv_mul` lands in
+`0..n_kv_heads`; and that the index arithmetic cannot overflow `usize`. The
+real slice expressions are transcribed into `exec fn`s operating on actual
+`&Vec<f32>` and `&[f32]` slices, so Verus discharges genuine slice-indexing
+obligations rather than assertions about symbolic expressions.
 
 #### Keeping the proof honest
 
@@ -176,7 +183,7 @@ verus: required rust toolchain 1.98.1-x86_64-unknown-linux-gnu not found
   rustup install 1.98.1-x86_64-unknown-linux-gnu
 Verus requires: 1.98.1-x86_64-unknown-linux-gnu
 --- 5. Verify the KV-cache index-safety proof ---
-verification results:: 24 verified, 0 errors
+verification results:: 36 verified, 0 errors
 ```
 
 That run is also what justified the ANSI-colour fix in the toolchain-discovery

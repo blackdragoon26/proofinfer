@@ -50,16 +50,26 @@ def md_tokens(path: Path) -> list[str]:
     raw = path.read_text()
     raw = re.sub(r"<!--.*?-->", " ", raw, flags=re.S)  # comments are not prose
     out: list[str] = []
+    in_fence = False
     for line in raw.splitlines():
         if line.lstrip().startswith("```"):
             # The fence's language is metadata, and the page carries it in a
             # class attribute, so neither side contributes a token. An earlier
             # version added a hardcoded "bash" here, which the page then lacked.
+            in_fence = not in_fence
             continue
-        s = re.sub(r"^#{1,6}\s+", "", line.strip())
-        # A list marker is structure, not prose: <ol> renders "1." through CSS
-        # and the marker never appears in the page's text.
-        s = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", s)
+        if in_fence:
+            # Inside a fenced code block, `# comment` and `1. item` are literal
+            # code text rendered verbatim inside `<pre><code>`, not markdown.
+            out += tokens(line)
+            continue
+        stripped = line.strip()
+        if re.match(r"^#{1,6}\s+", stripped):
+            s = re.sub(r"^#{1,6}\s+", "", stripped)
+        else:
+            # A list marker is structure, not prose: <ol> renders "1." through CSS
+            # and the marker never appears in the page's text.
+            s = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", stripped)
         s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)  # link -> its label
         s = s.replace("**", "").replace("`", "")
         s = re.sub(r"(?<![\w*])\*([^*\s][^*]*)\*(?![\w*])", r"\1", s)  # *emphasis*
@@ -89,8 +99,8 @@ def first_diff(a: list[str], b: list[str]) -> str:
 
 def main() -> int:
     failures = 0
-    for md_name, html_name, _title in PAGES:
-        a = md_tokens(REPO / "docs" / md_name)
+    for rel_md, html_name, _title in PAGES:
+        a = md_tokens(REPO / rel_md)
         b = html_tokens(SITE / html_name)
         if a == b:
             print(f"  ok    {html_name:<18} {len(a):5d} tokens, identical to the source")

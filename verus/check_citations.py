@@ -131,6 +131,19 @@ REGISTRY: dict[str, Check] = {
         symbol="checked_tensor_len",
         src_exprs=(".try_fold(1usize, |acc, &d| acc.checked_mul(d))",),
     ),
+    "model.rs::Weights::layer": Check(
+        src_file="model.rs",
+        symbol="Weights::layer",
+        src_exprs=(
+            "let start = l * per_layer;",
+            "&buf[start..start + per_layer]",
+        ),
+        verus_fn="exec_weight_layer_slice",
+        verus_exprs=(
+            "let start = l * per_layer;",
+            "&buf[start..start + per_layer]",
+        ),
+    ),
     "model.rs::State::new": Check(
         src_file="model.rs",
         symbol="State::new",
@@ -142,6 +155,13 @@ REGISTRY: dict[str, Check] = {
             'scores: try_zeroed_f32_vec("scores", config.seq_len)?',
             'key_cache: try_zeroed_f32_vec("kv cache", cache)?',
             'value_cache: try_zeroed_f32_vec("kv cache", cache)?',
+        ),
+        verus_fn="exec_checked_cache_len",
+        verus_exprs=(
+            "n_layers.checked_mul(seq_len)",
+            "layer_seq.checked_mul(kv_dim)",
+            "cache.checked_mul(4usize)",
+            "if bytes > isize::MAX as usize",
         ),
     ),
     "model.rs::State::forward@doc": Check(
@@ -174,6 +194,7 @@ REGISTRY: dict[str, Check] = {
             "let layer_end = layer_start + kv_layer_stride;",
             "&key_cache[layer_start..layer_end]",
             "&value_cache[layer_start..layer_end]",
+            "exec_attention_read( layer_k, layer_v, q, out, scores, n_heads, n_kv_heads, head_size, pos, );",
         ),
     ),
 }
@@ -724,6 +745,17 @@ def run_self_test(
                 "exec_attention_read",
                 "&key_cache[t * kv_dim + kv * head_size..t * kv_dim + (kv + 1) * head_size]",
                 "&key_cache[0..head_size]",
+            ),
+        ),
+        (
+            "verus-weight-layer-mutated",
+            "model.rs::Weights::layer",
+            sources,
+            mutate_token_span(
+                verus_source,
+                "exec_weight_layer_slice",
+                "&buf[start..start + per_layer]",
+                "&buf[0..per_layer]",
             ),
         ),
     ]
