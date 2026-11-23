@@ -27,7 +27,7 @@ Full detail, including how each check was shown to be able to fail, is in
 | Greedy output vs `run.c` | byte-identical at `-O3` and `-Ofast` |
 | Mutation: differential harness | 10/10 caught |
 | Mutation: Rust test suite | 21/21 caught |
-| Verus `--no-cheating` | 24 verified, 0 errors |
+| Verus `--no-cheating` | 36 verified, 0 errors |
 | Rust tests | 84, green in debug **and** release (MSRV 1.70.0) |
 | Throughput | 835 tok/s single-threaded (5.4x over the naive dot product) |
 
@@ -103,8 +103,8 @@ See [verus/README.md](verus/README.md) section 4 for pinned Verus downloads
 | [docs/performance.md](docs/performance.md) | the 8-lane dot product, the measurement method, and the gap left by `-Ofast` |
 | [docs/design.md](docs/design.md) | architecture, the decisions worth defending, trusted computing base, and what is *not* verified |
 | [CONTEXT.md](CONTEXT.md) | working design notes kept during the build |
-| [verus/README.md](verus/README.md) | the formal proof, its scope, and its eleven stated limitations |
-| [site/](site/) | the landing page — static, generated from these docs, no build step |
+| [verus/README.md](verus/README.md) | the formal proof (36 VCs, KV-cache + `State::new` + `Weights::layer`), its scope, and its explicit limits (also rendered at [site/proof.html](site/proof.html)) |
+| [site/](site/) | the landing page — static, generated from `verus/README.md` and `docs/`, no build step |
 
 ## Honest limits
 

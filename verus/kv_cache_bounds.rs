@@ -1,4 +1,4 @@
-//! Index safety for proofinfer's KV-cache slicing.
+//! Index safety for proofinfer's KV-cache and weight-layer slicing.
 //!
 //! A self-contained Verus development proving the property named in
 //! CONTEXT.md section 10, question 7:
@@ -6,21 +6,27 @@
 //! > KV-cache and attention indexing never goes out of bounds for any
 //! > `pos < seq_len`.
 //!
+//! Plus two extensions:
+//! - `State::new`'s checked cache-size arithmetic and `isize::MAX` byte bound
+//! - parametric `Weights::layer` slice bounds across all per-layer weight tensors
+//!
 //! This is a *standalone model* of the indexing arithmetic, not a
-//! verification of the crate. `verus/README.md` gives the line-by-line
+//! verification of the crate. `verus/README.md` gives the symbol-scoped
 //! mapping, the scope of what is and is not covered, and the command that
 //! checks this file.
 //!
 //! Layout:
 //!   1. `Shapes`, a ghost model of the config and the derived dimensions
-//!   2. the loader lemma, deriving the shape invariants from the checks the
-//!      loader actually performs
+//!   2. the loader lemmas, deriving the shape invariants and `kv_dim <= dim`
+//!      from the checks the loader actually performs
 //!   3. shape lemmas, including the GQA head mapping
 //!   4. the attention read lemma  (src/ops.rs)
-//!   5. the per-layer write and slice lemmas  (src/model.rs)
+//!   5. the per-layer write, slice, and weight-layer lemmas  (src/model.rs)
 //!   6. the bridge from mathematical `int` back to `usize`
-//!   7. the same index expressions transcribed as real Rust, so that Verus
-//!      discharges the actual slice-indexing obligations
+//!   7. the same index expressions transcribed as real Rust, including the
+//!      composed `forward -> attention` call, `State::new`'s checked cache
+//!      length, and `Weights::layer`, so Verus discharges the actual
+//!      slice-indexing obligations
 //!
 //! Tactic discipline, which is what makes this file verify: in this Verus
 //! release `by (nonlinear_arith)` decides polynomial *identities* only. It
@@ -102,7 +108,7 @@ impl Shapes {
 }
 
 // ===========================================================================
-// 2. The loader lemma
+// 2. The loader lemmas
 // ===========================================================================
 
 /// A `Shapes` value produced by the loader really does satisfy `valid()`.
@@ -150,6 +156,59 @@ pub proof fn lemma_shapes_from_config(
     let s = Shapes { n_layers, n_heads, n_kv_heads, head_size, seq_len };
     assert(s.valid());
     s
+}
+
+/// From `ops.rs::AttentionDims::try_new`'s checks alone, `kv_dim = head_size * n_kv_heads`
+/// never exceeds `dim` (and therefore never overflows `usize`).
+pub proof fn lemma_kv_dim_le_dim(dim: int, n_heads: int, n_kv_heads: int)
+    requires
+        dim > 0,
+        dim <= usize::MAX,
+        n_heads > 0,
+        n_kv_heads > 0,
+        dim % n_heads == 0,
+        n_heads % n_kv_heads == 0,
+    ensures
+        (dim / n_heads) * n_heads == dim,
+        (dim / n_heads) * n_kv_heads <= dim,
+        (dim / n_heads) * n_kv_heads <= usize::MAX,
+{
+    let head_size = dim / n_heads;
+    lemma_fundamental_div_mod(dim, n_heads);
+    assert(dim == n_heads * head_size + dim % n_heads);
+    lemma_mul_is_commutative(n_heads, head_size);
+    assert(head_size * n_heads == dim);
+    if head_size <= 0 {
+        lemma_mul_inequality(head_size, 0, n_heads);
+        assert(head_size * n_heads <= 0 * n_heads);
+        assert(0 * n_heads == 0) by (nonlinear_arith);
+        assert(dim <= 0);
+        assert(false);
+    }
+
+    let kv_mul = n_heads / n_kv_heads;
+    lemma_fundamental_div_mod(n_heads, n_kv_heads);
+    assert(n_heads == n_kv_heads * kv_mul + n_heads % n_kv_heads);
+    assert(n_heads == n_kv_heads * kv_mul);
+    if kv_mul <= 0 {
+        lemma_mul_inequality(kv_mul, 0, n_kv_heads);
+        lemma_mul_is_commutative(kv_mul, n_kv_heads);
+        assert(0 * n_kv_heads == 0) by (nonlinear_arith);
+        assert(n_heads <= 0);
+        assert(false);
+    }
+    assert(1 <= kv_mul);
+    lemma_mul_inequality(1, kv_mul, n_kv_heads);
+    lemma_mul_is_commutative(kv_mul, n_kv_heads);
+    assert(1 * n_kv_heads == n_kv_heads) by (nonlinear_arith);
+    assert(n_kv_heads <= n_heads);
+
+    lemma_mul_inequality(n_kv_heads, n_heads, head_size);
+    lemma_mul_is_commutative(n_kv_heads, head_size);
+    lemma_mul_is_commutative(n_heads, head_size);
+    assert(head_size * n_kv_heads <= head_size * n_heads);
+    assert(head_size * n_kv_heads <= dim);
+    assert(head_size * n_kv_heads <= usize::MAX);
 }
 
 // ===========================================================================
@@ -289,7 +348,7 @@ pub proof fn lemma_attention_row_in_layer(s: &Shapes, pos: int, t: int, kv: int)
 }
 
 // ===========================================================================
-// 5. The per-layer write and slice  (src/model.rs)
+// 5. The per-layer write, cache slice, and weight-layer lemmas  (src/model.rs)
 // ===========================================================================
 
 /// The layer slice `[l*stride, l*stride + stride)` is inside the whole cache.
@@ -306,6 +365,30 @@ pub proof fn lemma_layer_slice_in_cache(s: &Shapes, l: int)
     assert(l * s.kv_layer_stride() + s.kv_layer_stride() == (l + 1) * s.kv_layer_stride())
         by (nonlinear_arith);
     assert(s.cache_len() == s.n_layers * s.kv_layer_stride());
+}
+
+/// Parametric layer slice bound for `model.rs::Weights::layer`, covering all
+/// nine per-layer weight accessors (`rms_att`, `rms_ffn`, `wq`, `wk`, `wv`,
+/// `wo`, `w1`, `w2`, `w3`).
+pub proof fn lemma_layer_tensor_slice(n_layers: int, per_layer: int, l: int)
+    requires
+        n_layers > 0,
+        per_layer > 0,
+        0 <= l,
+        l < n_layers,
+    ensures
+        0 <= l * per_layer,
+        l * per_layer < l * per_layer + per_layer,
+        l * per_layer + per_layer <= n_layers * per_layer,
+{
+    lemma_mul_inequality(0, l, per_layer);
+    assert(0 * per_layer == 0) by (nonlinear_arith);
+    assert(0 <= l * per_layer);
+    assert(l + 1 <= n_layers);
+    lemma_mul_inequality(l + 1, n_layers, per_layer);
+    assert((l + 1) * per_layer <= n_layers * per_layer);
+    assert(l * per_layer + per_layer == (l + 1) * per_layer) by (nonlinear_arith);
+    assert(l * per_layer + per_layer <= n_layers * per_layer);
 }
 
 /// The per-layer cache write is in bounds (`model.rs::State::forward`):
@@ -430,36 +513,118 @@ pub proof fn lemma_index_fits_in_usize(index: int, buf_len: int)
 // ===========================================================================
 //
 // The lemmas above are arithmetic over a model. What ties them to *this
-// program* is what follows: the loop bodies of `ops::attention` and
-// `model::State::forward` with the index expressions copied across verbatim,
-// so that Verus discharges the actual `Vec` slice-indexing obligations,
-// including its implicit no-overflow check on the index arithmetic.
+// program* is what follows: the loop bodies of `ops::attention`,
+// `model::State::forward`, `model::State::new`'s checked cache sizing, and
+// `model::Weights::layer` with the index expressions copied across verbatim,
+// so that Verus discharges the actual slice-indexing obligations, including
+// its implicit no-overflow check on the index arithmetic.
 //
-// The `requires` of each function are exactly the facts the calling context
-// supplies: the overflow bounds come from `model.rs::State::new`'s
-// `checked_mul`, and the buffer-length bounds are the `debug_assert!`s in
-// `ops.rs::attention`, which `lemma_limit_rows_fit_in_layer` shows are implied
-// by the `pos < seq_len` guard in `model.rs::State::forward`.
-//
-// These functions are proof artifacts, never called. Their value is that a
-// future edit to one of these index expressions makes Verus say so.
+// `exec_forward_cache_write_and_layer_slice` now calls `exec_attention_read`
+// directly on `&key_cache[layer_start..layer_end]` and
+// `&value_cache[layer_start..layer_end]`, machine-checking the composition
+// across the `forward` -> `attention` boundary.
 
-/// `ops.rs::attention`, the cache reads.
+/// `model.rs::State::new`, the `checked_mul` cache-length arithmetic plus the
+/// `isize::MAX` byte-capacity bound enforced by `Vec::try_reserve_exact`.
+pub fn exec_checked_cache_len(
+    n_layers: usize,
+    seq_len: usize,
+    kv_dim: usize,
+) -> (res: Option<usize>)
+    requires
+        n_layers > 0,
+        seq_len > 0,
+        kv_dim > 0,
+    ensures
+        match res {
+            Some(cache) => {
+                &&& cache as int == (n_layers as int * seq_len as int) * kv_dim as int
+                &&& cache as int == n_layers as int * (seq_len as int * kv_dim as int)
+                &&& seq_len as int * kv_dim as int <= usize::MAX
+                &&& n_layers as int * (seq_len as int * kv_dim as int) <= usize::MAX
+                &&& cache as int * 4 <= isize::MAX
+            }
+            None => true,
+        },
+{
+    let layer_seq = match n_layers.checked_mul(seq_len) {
+        Some(v) => v,
+        None => return None,
+    };
+    let cache = match layer_seq.checked_mul(kv_dim) {
+        Some(v) => v,
+        None => return None,
+    };
+    let bytes = match cache.checked_mul(4usize) {
+        Some(b) => b,
+        None => return None,
+    };
+    if bytes > isize::MAX as usize {
+        return None;
+    }
+    proof {
+        assert(layer_seq as int == n_layers as int * seq_len as int);
+        assert(cache as int == layer_seq as int * kv_dim as int);
+        assert((n_layers as int * seq_len as int) * kv_dim as int
+            == n_layers as int * (seq_len as int * kv_dim as int)) by (nonlinear_arith);
+        assert(cache as int == n_layers as int * (seq_len as int * kv_dim as int));
+        assert(cache as int <= usize::MAX);
+        // Since n_layers >= 1 and seq_len * kv_dim >= 0, seq_len * kv_dim <= cache <= usize::MAX.
+        lemma_mul_inequality(0, seq_len as int, kv_dim as int);
+        assert(0 * kv_dim as int == 0) by (nonlinear_arith);
+        assert(0 <= seq_len as int * kv_dim as int);
+        assert(1 <= n_layers as int);
+        lemma_mul_inequality(1, n_layers as int, seq_len as int * kv_dim as int);
+        assert(1 * (seq_len as int * kv_dim as int) == seq_len as int * kv_dim as int)
+            by (nonlinear_arith);
+        assert(seq_len as int * kv_dim as int <= cache as int);
+        assert(seq_len as int * kv_dim as int <= usize::MAX);
+        assert(bytes as int == cache as int * 4);
+        assert(bytes as int <= isize::MAX as int);
+    }
+    Some(cache)
+}
+
+/// `model.rs::Weights::layer`, parametric slice bounds across all per-layer
+/// weight tensors (`rms_att`, `rms_ffn`, `wq`, `wk`, `wv`, `wo`, `w1`, `w2`, `w3`).
+pub fn exec_weight_layer_slice<'a>(
+    buf: &'a [f32],
+    n_layers: usize,
+    l: usize,
+    per_layer: usize,
+) -> (res: &'a [f32])
+    requires
+        n_layers > 0,
+        per_layer > 0,
+        l < n_layers,
+        n_layers as int * per_layer as int <= usize::MAX,
+        buf.len() == n_layers * per_layer,
+    ensures
+        res.len() == per_layer,
+{
+    proof {
+        lemma_layer_tensor_slice(n_layers as int, per_layer as int, l as int);
+        assert(l as int * per_layer as int + per_layer as int <= buf.len() as int);
+        assert(buf.len() as int <= usize::MAX);
+    }
+    let start = l * per_layer;
+    &buf[start..start + per_layer]
+}
+
+/// `ops.rs::attention`, the cache reads on `&[f32]` slices.
 ///
-/// `out` and `scores` are modelled as shared references rather than the `&mut`
-/// that the real signature uses. Writing to them cannot affect whether an index
-/// is in bounds, and Verus (correctly) refuses to carry `v.len()` across a loop
-/// iteration for a `&mut`, which would force the length to be re-read from a
-/// value it is not allowed to assume is stable. The property being proved is
-/// about indices, so the mutability is dropped here and the bounds checked
-/// against the real `out` and `scores` buffers.
+/// `out` and `scores` are modelled as shared slices (`&[f32]`) rather than
+/// `&mut [f32]`. Writing to them cannot affect whether an index is in bounds,
+/// and Verus (correctly) refuses to carry `s.len()` across a loop iteration
+/// for a `&mut`, so mutability is dropped here while slice bounds and
+/// overflow checks remain machine-checked.
 #[verifier::exec_allows_no_decreases_clause]
 pub fn exec_attention_read(
-    key_cache: &Vec<f32>,
-    value_cache: &Vec<f32>,
-    q: &Vec<f32>,
-    out: &Vec<f32>,
-    scores: &Vec<f32>,
+    key_cache: &[f32],
+    value_cache: &[f32],
+    q: &[f32],
+    out: &[f32],
+    scores: &[f32],
     n_heads: usize,
     n_kv_heads: usize,
     head_size: usize,
@@ -471,7 +636,7 @@ pub fn exec_attention_read(
         n_kv_heads > 0,
         n_heads % n_kv_heads == 0,
         head_size > 0,
-        // `model.rs::State::new`'s `checked_mul`
+        // `model.rs::State::new`'s `checked_mul` + `lemma_kv_dim_le_dim`
         head_size * n_kv_heads <= usize::MAX,
         n_heads * head_size <= usize::MAX,
         pos < usize::MAX,
@@ -659,30 +824,40 @@ pub fn exec_attention_read(
     }
 }
 
-/// `model.rs::State::forward`, the per-layer cache write and the layer slice
-/// handed to `ops::attention`.
+/// `model.rs::State::forward`, the per-layer cache write, layer slice, and
+/// composed call into `exec_attention_read` (`ops.rs::attention`).
 #[verifier::exec_allows_no_decreases_clause]
 pub fn exec_forward_cache_write_and_layer_slice(
     key_cache: &Vec<f32>,
     value_cache: &Vec<f32>,
+    q: &[f32],
+    out: &[f32],
+    scores: &[f32],
     n_layers: usize,
     seq_len: usize,
-    head_size: usize,
+    n_heads: usize,
     n_kv_heads: usize,
+    head_size: usize,
     pos: usize,
 )
     requires
-        // `model.rs::Config::validate`
+        // `model.rs::Config::validate` and `ops.rs::AttentionDims::try_new`
         n_layers > 0,
+        n_heads > 0,
         head_size > 0,
         n_kv_heads > 0,
+        n_heads % n_kv_heads == 0,
         // `model.rs::State::forward`'s guard
         pos < seq_len,
-        // `model.rs::State::new`'s `checked_mul`
+        // `model.rs::State::new`'s `checked_mul` + `lemma_kv_dim_le_dim`
         head_size * n_kv_heads <= usize::MAX,
+        n_heads * head_size <= usize::MAX,
         (n_layers * seq_len) * (head_size * n_kv_heads) <= usize::MAX,
         seq_len * (head_size * n_kv_heads) <= usize::MAX,
-        // the resulting allocation in `model.rs::State::new`
+        // the resulting allocations in `model.rs::State::new`
+        q.len() == n_heads * head_size,
+        out.len() == n_heads * head_size,
+        scores.len() >= seq_len,
         key_cache.len() == n_layers * (seq_len * (head_size * n_kv_heads)),
         value_cache.len() == n_layers * (seq_len * (head_size * n_kv_heads)),
 {
@@ -704,11 +879,18 @@ pub fn exec_forward_cache_write_and_layer_slice(
         invariant
             l <= n_layers,
             n_layers > 0,
+            n_heads > 0,
             head_size > 0,
             n_kv_heads > 0,
+            n_heads % n_kv_heads == 0,
             pos < seq_len,
+            head_size * n_kv_heads <= usize::MAX,
+            n_heads * head_size <= usize::MAX,
             kv_dim == head_size * n_kv_heads,
             kv_layer_stride == seq_len * kv_dim,
+            q.len() == n_heads * head_size,
+            out.len() == n_heads * head_size,
+            scores.len() >= seq_len,
             key_cache.len() == n_layers * kv_layer_stride,
             value_cache.len() == n_layers * kv_layer_stride,
         decreases n_layers - l,
@@ -744,11 +926,32 @@ pub fn exec_forward_cache_write_and_layer_slice(
         let _k_slot = &key_cache[base..base + kv_dim];
         let _v_slot = &value_cache[base..base + kv_dim];
 
-        // `model.rs::State::forward` layer slice
+        // `model.rs::State::forward` layer slice -> composed `ops.rs::attention` read
         let layer_start = l * kv_layer_stride;
         let layer_end = layer_start + kv_layer_stride;
-        let _layer = &key_cache[layer_start..layer_end];
-        let _layer_v = &value_cache[layer_start..layer_end];
+        let layer_k = &key_cache[layer_start..layer_end];
+        let layer_v = &value_cache[layer_start..layer_end];
+
+        proof {
+            assert(layer_k.len() == kv_layer_stride);
+            assert(layer_v.len() == kv_layer_stride);
+            assert((pos as int + 1) * (head_size as int * n_kv_heads as int)
+                <= kv_layer_stride as int);
+            assert(pos < usize::MAX);
+            assert(scores.len() >= pos + 1);
+        }
+
+        exec_attention_read(
+            layer_k,
+            layer_v,
+            q,
+            out,
+            scores,
+            n_heads,
+            n_kv_heads,
+            head_size,
+            pos,
+        );
 
         l = l + 1;
     }

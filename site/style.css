@@ -55,7 +55,7 @@ nav {
   padding: 1.1rem 0;
 }
 
-.navlinks { display: flex; gap: 1.1rem; flex-wrap: wrap; }
+.navlinks { display: flex; gap: 0.45rem 1.1rem; flex-wrap: wrap; }
 
 .navlinks a {
   font-size: 0.82rem;
@@ -69,7 +69,7 @@ nav {
 /* The page you are on. */
 .navlinks a.here { opacity: 1; font-weight: 600; }
 
-.navbtns { display: flex; gap: 0.5rem; }
+.navbtns { display: flex; gap: 0.5rem; flex-wrap: wrap; }
 
 .btn {
   display: inline-block;

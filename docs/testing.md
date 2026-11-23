@@ -157,9 +157,9 @@ red. This is the inventory:
 | byte-identical greedy output | a RoPE-less mutant binary: `bench.py` reports `DIFFERENT` and exits 1 |
 | zero-dependency & lockfile v3 assertion | a `Cargo.lock` with a second package, with zero packages, naming another package, or upgraded past `version = 3` — all rejected |
 | `reference/check_provenance.py` | 1-byte flip in a vendored file and an unlisted extra file in a scratch copy — both rejected |
-| `verus/check_citations.py` | built-in `--self-test` mutates `src/` upper slice bounds, `checked_mul(kv_dim)`, line/block comments, string-literal spoofing, token-boundary prefix (`0` -> `0x1`), `layer_end`, and weakens an `exec_*` slice in `verus/kv_cache_bounds.rs` — 8/8 rejected in CI |
+| `verus/check_citations.py` | built-in `--self-test` mutates `src/` upper slice bounds, `checked_mul(kv_dim)`, line/block comments, string-literal spoofing, token-boundary prefix (`0` -> `0x1`), `layer_end`, and weakens `exec_*` slices (`exec_attention_read` and `exec_weight_layer_slice`) in `verus/kv_cache_bounds.rs` — 9/9 rejected in CI |
 | CI workflow wiring | every `steps.<id>.outputs.<name>` resolves to a step that writes it, every `run:` block parses as bash, no `\|\| true` outside comments |
-| Verus itself | `--no-cheating` rejects `assume` / `admit` / `external_body`; the unmutated baseline is run first so "24 verified" cannot mean "the file does not parse" |
+| Verus itself | `--no-cheating` rejects `assume` / `admit` / `external_body`; the unmutated baseline is run first so "36 verified" cannot mean "the file does not parse" |
 
 The full-run commands are in the repository, not just in a shell history:
 `reference/mutation_check.py`, `reference/mutation_check_tests.py`,
