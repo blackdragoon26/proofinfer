@@ -155,6 +155,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 pub fn rmsnorm(out: &mut [f32], x: &[f32], weight: &[f32]) {
     debug_assert_eq!(out.len(), x.len());
     debug_assert_eq!(out.len(), weight.len());
+    if x.is_empty() {
+        return;
+    }
 
     let n = x.len() as f64;
     let mut ss = 0.0f64;
@@ -222,7 +225,7 @@ pub fn silu_value(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// `out = W @ x` where `W` is `d x n` stored row-major and `x` has length `n`.
+/// `out = W @ x` where `W` is `n x d` stored row-major and `x` has length `d`.
 ///
 /// Written as `out[i] = dot(W[i], x)`: each output element contracts a row of
 /// `W` with the whole activation vector. The dimensions are passed explicitly
@@ -549,6 +552,13 @@ mod tests {
     }
 
     #[test]
+    fn rmsnorm_of_empty_slice_is_a_no_op() {
+        let mut out: [f32; 0] = [];
+        rmsnorm(&mut out, &[], &[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn rope_is_the_identity_at_position_zero() {
         let n_heads = 3;
         let head_size = 8;
@@ -626,7 +636,7 @@ mod tests {
 
     #[test]
     fn matmul_matches_a_hand_computed_2x3_case() {
-        // W is d x n = 3 x 2, row-major:
+        // W is n x d = 2 x 3, row-major:
         //   [ 1  2  3 ]
         //   [ 4  5  6 ]
         // x has length d = 3.

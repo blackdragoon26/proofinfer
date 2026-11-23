@@ -101,7 +101,7 @@ Kernels:
 - `softmax`: subtract the max before `exp` (see Q3 in the interview list)
 - `rope`: within each head, rotate pair `(2i, 2i+1)` by `pos * 10000^(-2i/head_size)`
 - `silu(x) = x / (1 + exp(-x))`
-- `matmul(out, x, W, n, d)` where `W` is `d x n`, row-major
+- `matmul(out, x, W, n, d)` where `W` is `n x d`, row-major, and `x` has length `d`
 
 All scratch and both caches are allocated once in `State` and reused. Positions
 must be fed `0, 1, 2, ...` in order, because every step appends to the cache.
@@ -262,6 +262,7 @@ Everything above those is tested; those are assumed and stated.
    `src/ops.rs` and `src/model.rs` is a human transcription, and a refactor
    would leave it verifying a description of code that no longer exists. That
    edge is now partly blunted: `verus/check_citations.py` checks, in CI, that
-   every source line the proof cites still holds the construct it is cited for,
-   and it is negative-tested against exactly the edits it is meant to catch.
+   every symbol the proof cites still holds the exact normalized expressions in
+   both `src/` and `verus/kv_cache_bounds.rs`, and its `--self-test` verifies
+   mutations on either side are rejected.
 8. What is in the TCB?

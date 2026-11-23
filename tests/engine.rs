@@ -190,19 +190,19 @@ fn a_fresh_state_and_a_reset_state_agree() {
     for (pos, &t) in tokens.iter().enumerate() {
         reused.forward(&w, t, pos).unwrap();
     }
-    let first = reused.logits.clone();
+    let first = reused.logits().to_vec();
 
     reused.reset();
     for (pos, &t) in tokens.iter().enumerate() {
         reused.forward(&w, t, pos).unwrap();
     }
-    let after_reset = reused.logits.clone();
+    let after_reset = reused.logits().to_vec();
 
     let mut fresh = State::new(&w.config).unwrap();
     for (pos, &t) in tokens.iter().enumerate() {
         fresh.forward(&w, t, pos).unwrap();
     }
-    let virgin = fresh.logits.clone();
+    let virgin = fresh.logits().to_vec();
 
     assert_eq!(
         first, virgin,
@@ -335,7 +335,7 @@ fn generate_stops_on_bos_because_bos_delimits_documents() {
     let mut probe = State::new(&w.config).unwrap();
     let logits = probe.forward(&w, 0, 0).unwrap();
     assert_eq!(
-        argmax(logits).0 as u32,
+        argmax(logits).unwrap().0 as u32,
         proofinfer::tokenizer::BOS_ID,
         "fixture is wrong: the first step must predict BOS"
     );
@@ -357,7 +357,7 @@ fn generate_keeps_going_when_the_next_token_is_not_bos() {
     let mut probe = State::new(&w.config).unwrap();
     let logits = probe.forward(&w, 2, 0).unwrap();
     assert_ne!(
-        argmax(logits).0 as u32,
+        argmax(logits).unwrap().0 as u32,
         proofinfer::tokenizer::BOS_ID,
         "fixture is wrong: token 2 must not be a terminator"
     );
@@ -380,28 +380,36 @@ fn generate_keeps_going_when_the_next_token_is_not_bos() {
 
 #[test]
 fn argmax_finds_the_largest_element() {
-    assert_eq!(argmax(&[1.0, 5.0, 3.0]).0, 1);
-    assert_eq!(argmax(&[-1.0, -5.0, -3.0]).0, 0);
-    assert_eq!(argmax(&[7.0]).0, 0);
-    assert_eq!(argmax(&[0.0; 8]).0, 0);
+    assert_eq!(argmax(&[1.0, 5.0, 3.0]), Some((1, 5.0)));
+    assert_eq!(argmax(&[-1.0, -5.0, -3.0]), Some((0, -1.0)));
+    assert_eq!(argmax(&[7.0]), Some((0, 7.0)));
+    assert_eq!(argmax(&[0.0; 8]), Some((0, 0.0)));
     // Ties resolve to the first, which keeps generation deterministic.
-    assert_eq!(argmax(&[2.0, 2.0, 2.0]).0, 0);
+    assert_eq!(argmax(&[2.0, 2.0, 2.0]), Some((0, 2.0)));
 }
 
 #[test]
-fn argmax_is_total_on_nan_and_never_out_of_bounds() {
-    // A NaN must not cause a skip that returns a finite element, and must not
-    // panic. Both properties matter for a debug-vs-release consistent answer.
-    let (i, _) = argmax(&[1.0, f32::NAN, 3.0]);
-    assert!(i < 3);
+fn argmax_is_total_on_empty_and_surfaces_first_nan() {
+    assert_eq!(argmax(&[]), None);
 
-    let (i, _) = argmax(&[f32::NAN, 1.0]);
-    assert!(i < 2);
+    // First NaN wins immediately rather than being silently skipped behind a
+    // finite logit.
+    let (i, v) = argmax(&[1.0, f32::NAN, 3.0]).unwrap();
+    assert_eq!(i, 1);
+    assert!(v.is_nan());
+
+    let (i, v) = argmax(&[f32::NAN, 1.0]).unwrap();
+    assert_eq!(i, 0);
+    assert!(v.is_nan());
+
+    let (i, v) = argmax(&[f32::NAN, f32::NAN]).unwrap();
+    assert_eq!(i, 0);
+    assert!(v.is_nan());
 
     // All -inf is a degenerate but legal input.
-    let (i, v) = argmax(&[f32::NEG_INFINITY; 3]);
+    let (i, v) = argmax(&[f32::NEG_INFINITY; 3]).unwrap();
     assert_eq!(i, 0);
-    assert!(v.is_infinite());
+    assert_eq!(v, f32::NEG_INFINITY);
 }
 
 // ---------------------------------------------------------------------------
@@ -443,7 +451,7 @@ fn generate_continues_the_argmax_of_the_last_prompt_position() {
     for (pos, &t) in prompt.iter().enumerate() {
         probe.forward(&w, t, pos).unwrap();
     }
-    let expected_first = argmax(probe.logits.as_slice()).0 as u32;
+    let expected_first = argmax(probe.logits()).unwrap().0 as u32;
 
     let mut s = State::new(&w.config).unwrap();
     let gen = generate(&w, &mut s, &prompt, 5).unwrap();
@@ -480,8 +488,8 @@ fn state_scratch_matches_the_config() {
     let s = State::new(&w.config).unwrap();
     let dims = w.config.attention_dims().unwrap();
 
-    assert_eq!(s.x.len(), w.config.dim);
-    assert_eq!(s.logits.len(), w.config.vocab_size);
+    assert_eq!(s.x().len(), w.config.dim);
+    assert_eq!(s.logits().len(), w.config.vocab_size);
     // The cache is the dominant allocation and is exactly
     // n_layers * seq_len * kv_dim per cache.
     assert_eq!(
@@ -492,31 +500,24 @@ fn state_scratch_matches_the_config() {
 
 #[test]
 fn state_rejects_a_config_whose_cache_would_overflow() {
-    // Structurally legal, and legal in the way that matters: `head_size` must
-    // be *even* so the config gets past `AttentionDims::try_new` and actually
-    // reaches the cache arithmetic. The first version of this test used
-    // `i32::MAX`, which is odd, so `State::new` rejected the odd head size and
-    // returned `InvalidHeader` - the test passed without ever exercising the
-    // overflow it is named after. A mutation sweep caught that.
+    // Non-cache dimensions are deliberately tiny so that if the cache
+    // `checked_mul` guard is mutated away (e.g. `unwrap_or(0)`), State::new
+    // allocates ~40 bytes and returns `Ok` — failing the assertion cleanly
+    // rather than aborting with OOM on a huge `dim`.
     let cfg = Config {
-        dim: i32::MAX as usize - 1, // even, so head_size is even
+        dim: 2, // even, so head_size is even
         hidden_dim: 1,
-        n_layers: i32::MAX as usize,
+        n_layers: usize::MAX,
         n_heads: 1,
         n_kv_heads: 1,
         vocab_size: 1,
-        seq_len: i32::MAX as usize,
+        seq_len: 2,
     };
-    // Sanity: the shape really is acceptable, so the only thing left that can
-    // fail is the arithmetic.
     assert!(
         cfg.attention_dims().is_ok(),
         "fixture is wrong: the config must be structurally valid"
     );
 
-    // Assert the *specific* error, not just that there is one. Otherwise a
-    // future change that rejects this config for an unrelated reason would
-    // keep the test green while the overflow path went untested.
     match State::new(&cfg) {
         Err(proofinfer::model::LoadError::Overflow { what }) => {
             assert_eq!(what, "kv cache");
@@ -524,4 +525,98 @@ fn state_rejects_a_config_whose_cache_would_overflow() {
         Err(other) => panic!("expected an overflow error, got {other:?}"),
         Ok(_) => panic!("an unrepresentable cache must not be accepted"),
     }
+}
+
+#[test]
+fn state_rejects_zero_fields_and_byte_capacity_overflow() {
+    use proofinfer::model::LoadError;
+
+    // Zero fields must be rejected by State::new via Config::validate().
+    let base = Config {
+        dim: 2,
+        hidden_dim: 2,
+        n_layers: 1,
+        n_heads: 1,
+        n_kv_heads: 1,
+        vocab_size: 2,
+        seq_len: 2,
+    };
+    for bad in [
+        Config {
+            hidden_dim: 0,
+            ..base
+        },
+        Config {
+            n_layers: 0,
+            ..base
+        },
+        Config {
+            vocab_size: 0,
+            ..base
+        },
+        Config { seq_len: 0, ..base },
+    ] {
+        assert!(
+            matches!(State::new(&bad), Err(LoadError::InvalidHeader(_))),
+            "expected InvalidHeader for {bad:?}"
+        );
+    }
+
+    // `n_layers * seq_len * kv_dim` fits in usize, but `cache * 4 > isize::MAX`
+    // must fail cleanly via try_reserve_exact instead of panicking/aborting.
+    let byte_overflow = Config {
+        dim: 2,
+        hidden_dim: 1,
+        n_layers: (isize::MAX as usize / 8) + 1,
+        n_heads: 1,
+        n_kv_heads: 1,
+        vocab_size: 1,
+        seq_len: 1,
+    };
+    assert!(
+        matches!(
+            State::new(&byte_overflow),
+            Err(LoadError::Overflow { what: "kv cache" })
+        ),
+        "cache exceeding isize::MAX bytes must return Overflow"
+    );
+}
+
+#[test]
+fn forward_rejects_mismatched_state_and_weights() {
+    let w_tiny = tiny();
+    let w_gqa = gqa();
+    let mut s = State::new(&w_tiny.config).unwrap();
+    let err = s.forward(&w_gqa, 0, 0).unwrap_err();
+    assert!(
+        matches!(err, proofinfer::model::RunError::StateMismatch { .. }),
+        "expected StateMismatch, got {err:?}"
+    );
+}
+
+#[test]
+fn generate_rejects_overflowing_token_count() {
+    let w = tiny();
+    let mut s = State::new(&w.config).unwrap();
+    let err = generate(&w, &mut s, &[1], usize::MAX).unwrap_err();
+    assert!(
+        matches!(err, proofinfer::model::RunError::TooManyTokens { .. }),
+        "expected TooManyTokens on usize::MAX, got {err:?}"
+    );
+}
+
+#[test]
+fn generate_rejects_nan_logits_even_at_bos_index() {
+    // Regression: if logit[BOS_ID] (index 1) is NaN, argmax returns (1, NaN).
+    // `generate` must report NonFiniteLogit instead of treating index 1 as BOS
+    // termination and returning Ok([]).
+    let mut w = tiny();
+    let d = w.config.dim;
+    let mut cls = w.tok_embedding.clone();
+    cls[d] = f32::NAN; // row 1 (BOS_ID), first coefficient
+    w.wcls = Some(cls);
+
+    let mut s = State::new(&w.config).unwrap();
+    let err = generate(&w, &mut s, &[2], 4).unwrap_err();
+    assert_eq!(err, proofinfer::model::RunError::NonFiniteLogit { pos: 0 });
 }

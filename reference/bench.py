@@ -15,15 +15,14 @@ Two things happen here, and the second is the more important one:
    and it is a genuinely independent check because `run.c` is a third
    implementation with its own matmul, its own softmax and its own RoPE.
 
-The comparison strips a single trailing newline from both sides. proofinfer
-prints one so the shell prompt starts on a fresh line; `run.c` does not. Nothing
-else is normalised - if the two engines disagree by so much as one token, this
-fails.
+The comparison strips at most one trailing newline from both sides (both
+proofinfer and `run.c` print a final newline after generation). Nothing else is
+normalised - if the two engines disagree by so much as one token, this fails.
 
-Build the C reference first:
+Build the C reference first (`-lm` is required on Linux/glibc):
 
-    cc -O3 -march=native -o /tmp/run_O3   reference/llama2c/run.c
-    cc -Ofast              -o /tmp/run_Ofast reference/llama2c/run.c
+    cc -O3 -march=native -o /tmp/run_O3    reference/llama2c/run.c -lm
+    cc -Ofast            -o /tmp/run_Ofast reference/llama2c/run.c -lm
 
 Usage:
     python3 reference/bench.py --model /tmp/stories15M.bin
@@ -71,9 +70,8 @@ class Engine:
                 f"  stderr: {stderr.strip()}"
             )
         tps = float(matches[-1])
-        # Strip exactly one trailing newline from each side so the CLI's
-        # convenience newline is not counted as a text difference.
-        return tps, proc.stdout.rstrip(b"\n"), stderr
+        # Strip at most one trailing newline from each side.
+        return tps, proc.stdout.removesuffix(b"\n"), stderr
 
 
 def bench(engine: Engine, runs: int) -> tuple[list[float], bytes]:
@@ -146,14 +144,11 @@ def main() -> int:
     tiny = Engine("proofinfer", tiny_cmd, TINY_TPS_RE)
 
     # run.c's `-n` counts *total* forward passes from position 0, prompt
-    # included: its loop is `while (pos < steps)` with pos starting at 0. Ours
-    # counts generated tokens only. Giving both the same number would make one
-    # of them stop early, and the outputs would then differ by length for a
-    # reason that has nothing to do with the maths - which is exactly the kind
-    # of false failure that trains you to ignore the check.
-    #
-    # So: learn the prompt length from proofinfer's own stderr, then ask run.c
-    # for `prompt + n` total steps. Both then generate exactly `n` tokens.
+    # included: its loop is `while (pos < steps)` where the first
+    # `prompt_tokens - 1` iterations consume the prompt (after BOS) and each
+    # remaining iteration emits one generated token. Total steps for `n`
+    # generated tokens is therefore `prompt_tokens + n - 1` (matching
+    # proofinfer's own `prompt.len() + n - 1` forward-pass count).
     probe_tps, probe_out, probe_err = tiny.run()
     m = PROMPT_TOKENS_RE.search(probe_err)
     if not m:
@@ -162,10 +157,10 @@ def main() -> int:
             f"got:\n{probe_err.strip()}"
         )
     prompt_tokens = int(m.group(1))
-    c_steps = prompt_tokens + n
+    c_steps = prompt_tokens + n - 1
     if c_steps > seq_len:
         raise RuntimeError(
-            f"prompt ({prompt_tokens}) + {n} generated = {c_steps} exceeds the "
+            f"prompt ({prompt_tokens}) + {n} generated - 1 = {c_steps} exceeds the "
             f"context ({seq_len}); lower --n"
         )
     print(
@@ -176,7 +171,7 @@ def main() -> int:
 
     engines = [tiny]
     for c in args.run_c:
-        p = Path(c)
+        p = Path(c).resolve()
         if not p.exists():
             print(f"error: {c} does not exist", file=sys.stderr)
             return 2

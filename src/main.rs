@@ -26,7 +26,7 @@
 use std::error::Error;
 use std::fmt;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -246,14 +246,32 @@ fn main() -> ExitCode {
     }
 }
 
+/// Classify a stdout write/flush result.
+///
+/// `BrokenPipe` (for example piping into `head`) terminates output cleanly
+/// with `Ok(false)` instead of panicking or printing a spurious error; any
+/// other I/O error is propagated so `main` exits non-zero.
+fn handle_stdout_io(res: io::Result<()>) -> Result<bool, Box<dyn Error>> {
+    match res {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(Box::new(e)),
+    }
+}
+
 fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
     let args = match parse_args(argv)? {
         Action::Help => {
-            print!("{USAGE}");
+            let mut out = io::stdout().lock();
+            let _ = handle_stdout_io(out.write_all(USAGE.as_bytes()).and_then(|()| out.flush()))?;
             return Ok(ExitCode::SUCCESS);
         }
         Action::Version => {
-            println!("proofinfer {}", env!("CARGO_PKG_VERSION"));
+            let mut out = io::stdout().lock();
+            let _ = handle_stdout_io(
+                writeln!(out, "proofinfer {}", env!("CARGO_PKG_VERSION"))
+                    .and_then(|()| out.flush()),
+            )?;
             return Ok(ExitCode::SUCCESS);
         }
         Action::Run(a) => *a,
@@ -337,15 +355,31 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
                 prompt.len(),
                 args.num_tokens
             );
-            print_tokens(&tokenizer, &prompt, None);
+            {
+                let mut out = io::stdout().lock();
+                if !handle_stdout_io(print_tokens(&mut out, &tokenizer, &prompt, None))? {
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
 
             let start = Instant::now();
             let generated = model::generate(&weights, &mut state, &prompt, args.num_tokens)?;
             let elapsed = start.elapsed();
 
-            print_tokens(&tokenizer, &generated, prompt.last().copied());
-            println!();
-            let _ = std::io::stdout().flush();
+            {
+                let mut out = io::stdout().lock();
+                if !handle_stdout_io(print_tokens(
+                    &mut out,
+                    &tokenizer,
+                    &generated,
+                    prompt.last().copied(),
+                ))? {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                if !handle_stdout_io(out.write_all(b"\n").and_then(|()| out.flush()))? {
+                    return Ok(ExitCode::SUCCESS);
+                }
+            }
 
             // Throughput counts the prompt as well as the generated tokens.
             //
@@ -380,43 +414,48 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
 ///
 /// `prev` is the token before this sequence, needed because the dummy-prefix
 /// rule depends on it. Pass `None` for a sequence that starts at BOS.
-fn print_tokens(tokenizer: &Tokenizer, tokens: &[u32], prev: Option<u32>) {
+fn print_tokens<W: Write>(
+    out: &mut W,
+    tokenizer: &Tokenizer,
+    tokens: &[u32],
+    prev: Option<u32>,
+) -> io::Result<()> {
     let mut previous = prev;
     for &token in tokens {
-        let piece = tokenizer.decode_one(previous, token);
-        safe_print(&piece);
+        let bytes = tokenizer.decode_one_bytes(previous, token);
+        safe_print(out, &bytes)?;
         previous = Some(token);
     }
+    Ok(())
 }
 
-/// Print one decoded piece, skipping the ones llama2.c would skip.
+/// Write one decoded raw-byte piece, skipping the ones llama2.c would skip.
 ///
-/// A single non-printable, non-whitespace byte is dropped. The reasoning is the
-/// reference's: byte-fallback tokens can name any byte at all, including
-/// control characters and half of a multi-byte UTF-8 sequence, and echoing
-/// those raw into a terminal is unpleasant and occasionally terminal-escaping.
-/// Pieces of two bytes or more are printed whole even if they are not valid
-/// UTF-8, which is the reference's behaviour and the reason this cannot simply
-/// be "print valid UTF-8".
+/// A single non-printable, non-whitespace byte (including single non-ASCII
+/// bytes `0x80..=0xFF` from byte-fallback tokens) is dropped before any UTF-8
+/// conversion. The reasoning is the reference's: byte-fallback tokens can name
+/// any byte at all, including control characters and half of a multi-byte UTF-8
+/// sequence, and echoing those raw into a terminal is unpleasant and
+/// occasionally terminal-escaping. Pieces of two bytes or more are written
+/// verbatim even if they are not valid UTF-8, matching `run.c`'s `safe_printf`.
 ///
 /// "Printable" is ASCII 0x20..=0x7E and "whitespace" is the C library's
 /// `isspace` set. Both are spelled out rather than delegated to
 /// `char::is_control` because the point is to match a specific C
 /// implementation, not to have a defensible opinion about Unicode.
-fn safe_print(piece: &str) {
-    let bytes = piece.as_bytes();
+fn safe_print<W: Write>(out: &mut W, bytes: &[u8]) -> io::Result<()> {
     if bytes.is_empty() {
-        return;
+        return Ok(());
     }
     if bytes.len() == 1 {
         let b = bytes[0];
         let printable = (0x20..=0x7e).contains(&b);
         let whitespace = matches!(b, b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
         if !(printable || whitespace) {
-            return;
+            return Ok(());
         }
     }
-    print!("{piece}");
+    out.write_all(bytes)
 }
 
 /// Create an output file, turning a path problem into a normal error.
@@ -428,10 +467,9 @@ fn create_file(path: &Path) -> Result<File, Box<dyn Error>> {
 
 /// Write one position's logits as raw little-endian `f32`.
 ///
-/// Serialised through a reusable byte buffer rather than four `write_all` calls
+/// Serialised through a per-row byte buffer rather than four `write_all` calls
 /// per element: a 32000-entry vocabulary at every position turns the naive form
-/// into a syscall storm. The buffer is allocated once per row and refilled, so
-/// the cost is one memcpy per element and one write per row.
+/// into a syscall storm.
 fn write_logits<W: Write>(w: &mut W, logits: &[f32]) -> Result<(), Box<dyn Error>> {
     let mut bytes = Vec::with_capacity(logits.len() * 4);
     for &v in logits {
@@ -439,4 +477,45 @@ fn write_logits<W: Write>(w: &mut W, logits: &[f32]) -> Result<(), Box<dyn Error
     }
     w.write_all(&bytes)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct BrokenPipeWriter;
+
+    impl Write for BrokenPipeWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+        }
+    }
+
+    #[test]
+    fn safe_print_matches_run_c_on_single_and_multibyte_raw_bytes() {
+        let mut out = Vec::new();
+        // Printable ASCII and C whitespace pass through.
+        safe_print(&mut out, b"A").unwrap();
+        safe_print(&mut out, b"\n").unwrap();
+        safe_print(&mut out, b"\t").unwrap();
+        // Single control and non-ASCII bytes are dropped (not turned into U+FFFD).
+        for b in [0x00u8, 0x07, 0x1b, 0x7f, 0x80, 0xc3, 0xff] {
+            safe_print(&mut out, &[b]).unwrap();
+        }
+        // Multi-byte non-UTF-8 pieces are written verbatim.
+        safe_print(&mut out, &[0xff, 0xfe]).unwrap();
+
+        assert_eq!(out, b"A\n\t\xff\xfe");
+    }
+
+    #[test]
+    fn broken_pipe_stops_output_without_error() {
+        let mut w = BrokenPipeWriter;
+        let res = safe_print(&mut w, b"hello");
+        assert!(!handle_stdout_io(res).unwrap());
+    }
 }

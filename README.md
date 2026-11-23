@@ -28,14 +28,14 @@ Full detail, including how each check was shown to be able to fail, is in
 | Mutation: differential harness | 10/10 caught |
 | Mutation: Rust test suite | 21/21 caught |
 | Verus `--no-cheating` | 24 verified, 0 errors |
-| Rust tests | 75, green in debug **and** release |
+| Rust tests | 84, green in debug **and** release (MSRV 1.70.0) |
 | Throughput | 835 tok/s single-threaded (5.4x over the naive dot product) |
 
 ## Quick start
 
 ```sh
-cargo build --release
-cargo test                              # 75 tests, both profiles
+cargo build --release --locked
+cargo test --locked                     # 84 tests (debug + release)
 ```
 
 Generate from text, with a real checkpoint:
@@ -57,18 +57,43 @@ PY
     -z reference/llama2c/tokenizer.bin -i "Once upon a time" -n 248
 ```
 
-Run the harnesses (needs CPU-only PyTorch):
+## Local verification checklist
+
+Checks are grouped in three tiers matching `.github/workflows/ci.yml`:
+
+**Tier 1 — Rust, provenance, citations, static site (no extra downloads):**
 
 ```sh
-python -m venv .venv
-.venv/bin/pip install numpy torch \
+cargo fmt --all --check
+cargo clippy --all-targets --release -- -D warnings
+cargo test --release --locked
+cargo test --locked
+python3 reference/mutation_check_tests.py          # 21/21 caught
+python3 reference/check_provenance.py              # 7/7 vendored sha256s
+python3 verus/check_citations.py --self-test && python3 verus/check_citations.py
+python3 site/sync.py --check && python3 site/check_docs.py && python3 site/check_light.py
+node site/motion_test.js
+```
+
+**Tier 2 — PyTorch differential, mutation, and `run.c` byte-identity (needs CPU-only PyTorch):**
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install -r reference/requirements.txt \
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple
 
-.venv/bin/python reference/diff_test.py        # 6/6 vs PyTorch
-.venv/bin/python reference/mutation_check.py    # can the harness fail?
-.venv/bin/python reference/mutation_check_tests.py  # can the tests fail?
+.venv/bin/python reference/diff_test.py            # 6/6 vs PyTorch
+.venv/bin/python reference/mutation_check.py       # 10/10 caught
+.venv/bin/python reference/diff_test.py --checkpoint stories15M.pt -n 200 --export-bin stories15M.bin
+cc -O3 -o run_O3 reference/llama2c/run.c -lm
+python3 reference/bench.py --model stories15M.bin --runs 1 --run-c ./run_O3
 ```
+
+**Tier 3 — Verus formal proof (`--no-cheating`):**
+
+See [verus/README.md](verus/README.md) section 4 for pinned Verus downloads
+(Linux x86_64 and macOS arm64) and isolated `RUSTUP_HOME` setup.
 
 ## Documentation
 
@@ -99,7 +124,8 @@ python -m venv .venv
 The PyTorch reference, the legacy export format, the tokenizer format, the C
 engine, and the expected token id vectors all come from
 [karpathy/llama2.c](https://github.com/karpathy/llama2.c) (MIT). The files under
-`reference/llama2c/` are vendored **byte-for-byte unmodified**; sha256 for each
-is recorded in `reference/llama2c/PROVENANCE.md`.
+`reference/llama2c/` are vendored **byte-for-byte unmodified**; full 64-hex
+sha256 digests are recorded in `reference/llama2c/PROVENANCE.md` and checked in
+CI by `reference/check_provenance.py`.
 
 MIT licensed. See [LICENSE](LICENSE).

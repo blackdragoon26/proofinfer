@@ -1,21 +1,23 @@
 # CI for proofinfer.
 #
-# Three jobs, and the split is the point: the cheap correctness checks are
+# Six jobs, and the split is the point: the cheap correctness checks are
 # separate from the expensive differential ones, so a reviewer opening this file
 # can see at a glance what each guarantee rests on.
 #
-#   rust          fmt, clippy, unit/integration tests, the zero-dependency
-#                 assertion, and a mutation sweep proving those tests can
-#                 fail. The slowest step is the sweep, which rebuilds the
-#                 crate 21 times.
-#   differential  the six-config comparison against PyTorch, then the mutation
-#                 check that proves the comparison can fail.
-#   real-weights  the same comparison against a genuinely trained
-#                 stories15M checkpoint, on a 200-token sequence chosen by the
-#                 reference decoder.
-#   proof         the Verus development in verus/, plus a check that it still
-#                 describes the code it claims to describe. Added after the
-#                 proof landed; the other three are unchanged.
+#   rust                 fmt, clippy, release + debug tests, the zero-dependency
+#                        and Cargo.lock v3 assertion, and a mutation sweep
+#                        proving those tests can fail.
+#   msrv                 release build + test suite on the documented minimum
+#                        supported Rust version (1.70.0).
+#   site-and-provenance  vendored reference SHA-256 verification and all static
+#                        site parity, contrast, and motion checks.
+#   differential         the six-config comparison against PyTorch, then the
+#                        mutation check that proves the comparison can fail.
+#   real-weights         the same comparison against a genuinely trained
+#                        stories15M checkpoint (200 tokens), plus byte-identical
+#                        output verification against Karpathy's C run.c.
+#   proof                bidirectional citation drift + self-test, followed by
+#                        Verus `--no-cheating` verification of verus/.
 #
 # There is no `continue-on-error` and no `|| true` anywhere in this file, and
 # there will not be. A test that cannot fail is worse than no test, because it
@@ -23,6 +25,9 @@
 # correct response is to find the bug, not to soften the check.
 
 name: CI
+
+permissions:
+  contents: read
 
 on:
   push:
@@ -39,11 +44,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # One place to change the toolchain, so the three Rust jobs agree. The `proof`
-  # job deliberately does not use this: Verus is built against one specific
-  # rustc, prints the exact `rustup install` line for it when it is missing, and
-  # installs that instead. Pinning RUSTUP_TOOLCHAIN here would hand Verus a
-  # toolchain it cannot use.
+  # One place to change the toolchain for the stable Rust jobs. The `msrv` job
+  # pins 1.70.0 explicitly, and the `proof` job uses its own isolated
+  # RUSTUP_HOME because Verus requires one specific rustc release.
   RUST_TOOLCHAIN: stable
 
 jobs:
@@ -69,16 +72,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      # Asserted before anything else runs. If a dependency ever sneaks in, the
-      # build should stop here rather than at the end of a long pipeline, and
-      # the message should say exactly which packages appeared.
+      # Asserted before anything else runs. If a dependency ever sneaks in, or
+      # if Cargo.lock is silently bumped to v4 (breaking Rust 1.70.0), the
+      # build should stop here with an exact diagnostic.
       #
-      # The count is taken with awk rather than `grep -c ... || true`. grep
-      # exits 1 when it finds nothing, which is the *expected* result for an
-      # empty file, and the usual ways of papering over that are exactly the
-      # `|| true` this repository forbids. awk exits 0 either way, so no
+      # The count is taken with awk rather than `grep -c ... || true` so no
       # escape hatch is needed.
-      - name: Assert zero external dependencies
+      - name: Assert zero external dependencies and Cargo.lock v3
         run: |
           set -euo pipefail
           count=$(awk '/^\[\[package\]\]/{n++} END{print n+0}' Cargo.lock)
@@ -92,7 +92,12 @@ jobs:
             cat Cargo.lock
             exit 1
           fi
-          echo "Cargo.lock contains exactly one package: proofinfer"
+          if ! grep -q '^version = 3$' Cargo.lock; then
+            echo "::error::Cargo.lock must stay at version = 3 for Rust 1.70.0 MSRV"
+            head -10 Cargo.lock
+            exit 1
+          fi
+          echo "Cargo.lock is version 3 and contains exactly one package: proofinfer"
 
       # --locked fails if Cargo.lock is out of date with Cargo.toml, which is
       # what stops a dependency change from being quietly committed without the
@@ -120,17 +125,58 @@ jobs:
       #
       # `cargo test` passing says the suite agrees with the code. It does not
       # say the suite can *notice* disagreement. This injects 21 realistic bugs
-      # one at a time and requires `cargo test` to fail on every one, which is
-      # the difference between "75 tests" and "75 tests that would catch 21
-      # known defects".
-      #
-      # It found two real holes when it was first run, and both are now fixed:
-      # the RoPE tests were all structural invariants satisfied by *any*
-      # frequencies, so `2 * i` -> `i` passed every one of them; and nothing
-      # covered generation's BOS termination, which is the bug the byte-identity
-      # check found by hand.
+      # one at a time and requires `cargo test` to compile cleanly and fail at
+      # least one test on every one.
       - name: Prove the test suite can fail
         run: python reference/mutation_check_tests.py
+
+  # ---------------------------------------------------------------------------
+  msrv:
+    name: msrv (Rust 1.70.0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.70.0
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.70.0"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.70.0
+
+      - name: Build (locked)
+        run: cargo build --release --locked
+
+      - name: Test (debug, locked)
+        run: cargo test --locked
+
+  # ---------------------------------------------------------------------------
+  site-and-provenance:
+    name: site + vendored provenance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Verify vendored llama2.c provenance
+        run: python reference/check_provenance.py
+
+      - name: Check static site parity, contrast, and motion
+        run: |
+          set -euo pipefail
+          python site/sync.py --check
+          python site/check_docs.py
+          python site/check_light.py
+          node site/motion_test.js
 
   # ---------------------------------------------------------------------------
   differential:
@@ -149,14 +195,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: reference/requirements.txt
 
-      # CPU-only torch. The CUDA wheel is several gigabytes and this job never
-      # touches a GPU, so the CPU index is both faster and more honest about
-      # what is being tested.
+      # CPU-only torch pinned in reference/requirements.txt (`torch<2.6` keeps
+      # vendored llama2c/export.py's torch.load working without editing it).
       - name: Install numpy and CPU torch
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy torch \
+          python -m pip install -r reference/requirements.txt \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple
 
@@ -178,7 +225,7 @@ jobs:
 
   # ---------------------------------------------------------------------------
   real-weights:
-    name: real weights (stories15M)
+    name: real weights (stories15M + run.c)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -193,11 +240,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: reference/requirements.txt
 
       - name: Install numpy and CPU torch
         run: |
           python -m pip install --upgrade pip
-          python -m pip install numpy torch \
+          python -m pip install -r reference/requirements.txt \
             --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple
 
@@ -221,15 +270,25 @@ jobs:
 
       # A genuinely trained 15M-parameter Llama, with real weight distributions
       # and a 32000-entry vocabulary, on a 200-token sequence chosen by the
-      # reference greedy decoder rather than by us. The random-weight suite
-      # proves the arithmetic; this proves the engine runs real weights.
+      # reference greedy decoder rather than by us. Also exports stories15M.bin
+      # for the byte-identity check against C run.c below.
       - name: Differential test on real weights
-        run: python reference/diff_test.py --checkpoint stories15M.pt -n 200
+        run: python reference/diff_test.py --checkpoint stories15M.pt -n 200 --export-bin stories15M.bin
+
+      # Compile vendored run.c with -O3 (no -ffast-math) and assert
+      # byte-identical greedy output on stories15M.bin.
+      - name: Byte-identical check against reference C run.c
+        run: |
+          set -euo pipefail
+          cc -O3 -o run_O3 reference/llama2c/run.c -lm
+          python reference/bench.py --model stories15M.bin --runs 1 --run-c "$PWD/run_O3"
 
   # ---------------------------------------------------------------------------
   proof:
     name: proof (Verus + citation drift)
     runs-on: ubuntu-latest
+    env:
+      RUSTUP_HOME: ${{ github.workspace }}/.verus-rustup
     steps:
       - uses: actions/checkout@v4
 
@@ -237,20 +296,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      # The cheapest and most important step in this job.
-      #
-      # `verus/kv_cache_bounds.rs` is a *model* of the indexing arithmetic;
-      # `src/ops.rs` and `src/model.rs` contain no `verus!` macro and are never
-      # compiled by Verus. So a green Verus run does not by itself prove the
-      # proof still matches the code. This check closes that gap for the likely
-      # failure mode: it verifies that every source line the proof cites still
-      # contains the construct it is cited for. Change `h / kv_mul` to anything
-      # else, or refactor and shift the line numbers, and this goes red.
+      # Bidirectional cross-file citation check + self-test proving mutations
+      # on either `src/` or `verus/kv_cache_bounds.rs` turn the build red.
       - name: Check the proof still describes the current source
-        run: python verus/check_citations.py
+        run: |
+          set -euo pipefail
+          python verus/check_citations.py --self-test
+          python verus/check_citations.py
 
       # 485 MB, so it is cached rather than re-fetched on every push. The key
-      # includes the Verus version, so bumping Verus busts the cache.
+      # includes the Verus version and sha256, so bumping Verus busts the cache.
       - name: Cache the Verus release
         id: verus-cache
         uses: actions/cache@v4
@@ -266,19 +321,13 @@ jobs:
           set -euo pipefail
           curl -fSL --retry 3 --retry-delay 5 -o verus.zip \
             'https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip'
-          # Pinned to the digest GitHub publishes for this asset, so the 485 MB
-          # download is verified rather than trusted. `sha256sum` rather than
-          # `shasum` because the runner is ubuntu and sha256sum is the one
-          # guaranteed by coreutils there.
           echo '7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus.zip' \
             | sha256sum --check --strict -
           mkdir -p verus-dist
           unzip -q verus.zip -d verus-dist
+          rm -f verus.zip
 
       - name: Locate the Verus binary
-        # The archive's internal directory name is not part of its contract, so
-        # find the binary rather than hardcoding a path that a release could
-        # rename out from under us.
         id: verus-bin
         run: |
           set -euo pipefail
@@ -291,39 +340,40 @@ jobs:
           echo "Found Verus at $bin"
           echo "path=$bin" >> "$GITHUB_OUTPUT"
 
+      - name: Cache Verus rustup toolchain
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.verus-rustup
+          key: verus-rustup-0.2026.09.20.aef82ed-x86-linux
+
       - name: Install the toolchain Verus requires
         run: |
           set -euo pipefail
           bin=${{ steps.verus-bin.outputs.path }}
-          # Verus exits non-zero when its toolchain is not installed, and that
-          # error message is exactly what this step exists to read. Under
-          # `set -e` that *expected* non-zero status aborts the step before the
-          # message is ever parsed, so errexit is disabled for the one command
-          # and restored immediately afterwards.
-          #
-          # This is deliberately not `|| true`. The status is captured and
-          # printed, and the step still fails if the message turns out to be
-          # unparseable - which is the thing worth failing on.
           set +e
           raw=$("$bin" --version 2>&1)
           verus_status=$?
           set -e
-          echo "verus --version exited $verus_status (non-zero is expected here)"
-          # The ANSI colour codes are stripped first. They are not cosmetic:
-          # Verus indents the `rustup install` line and wraps the command in
-          # an escape sequence, so a `sed` anchored at the start of the line
-          # after whitespace matches nothing and the step would fail with
-          # "could not determine which toolchain Verus requires".
           clean=$(printf '%s\n' "$raw" | sed 's/\x1b\[[0-9;]*m//g')
           printf '%s\n' "$clean"
-          need=$(printf '%s\n' "$clean" \
-            | sed -n 's/^[[:space:]]*rustup install \([^[:space:]]*\).*$/\1/p' | head -1)
-          if [ -z "$need" ]; then
-            echo "::error::could not determine which toolchain Verus requires"
-            exit 1
+          if [ "$verus_status" -eq 0 ]; then
+            if ! printf '%s\n' "$clean" | grep -q '^Verus$' || \
+               ! printf '%s\n' "$clean" | grep -q 'Toolchain:'; then
+              echo "::error::verus --version exited 0 without expected Verus/Toolchain output"
+              exit 1
+            fi
+            echo "Verus toolchain already installed in cache"
+          else
+            need=$(printf '%s\n' "$clean" \
+              | sed -n 's/^[[:space:]]*rustup install \([^[:space:]]*\).*$/\1/p' | head -1)
+            if [ -z "$need" ]; then
+              echo "::error::could not determine which toolchain Verus requires"
+              exit 1
+            fi
+            echo "Verus requires: $need"
+            rustup toolchain install "$need"
+            "$bin" --version
           fi
-          echo "Verus requires: $need"
-          rustup toolchain install "$need"
 
       # --no-cheating rejects assume, admit and external_body, so "24 verified,
       # 0 errors" is a claim about the file rather than a comment in it.

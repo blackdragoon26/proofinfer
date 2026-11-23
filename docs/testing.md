@@ -98,23 +98,28 @@ Two guards keep that number honest:
 
 #### Rust tests, and proof they can fail
 
-75 tests, passing in both release and debug (debug matters: it enables integer
+84 tests, passing in both release and debug (debug matters: it enables integer
 overflow checks, which is where a wrapping size computation in the loader would
-show up).
+show up), and tested on the documented MSRV (`1.70.0`) as well as stable.
 
 | suite | tests | what it covers |
 |---|---|---|
-| `src/ops.rs` | 23 | kernels against hand-computed answers, RoPE invariants *and* its frequency schedule, causality of the attention window, `dot` across every length mod 8 |
+| `src/ops.rs` | 24 | kernels against hand-computed answers, empty-slice totality, RoPE invariants *and* its frequency schedule, causality of the attention window, `dot` across every length mod 8 |
+| `src/main.rs` | 2 | raw-byte `safe_print` parity with `run.c` and clean `BrokenPipe` handling |
 | `tests/loader.rs` | 18 | totality over hostile input, 2000 pseudo-random buffers, overflow, tensor ordering |
-| `tests/tokenizer.rs` | 16 | exact conformance to Meta's published token ids, byte fallback, round trips |
-| `tests/engine.rs` | 18 | causality, determinism, BOS termination, `State::reset` equivalence, `argmax` totality on NaN |
+| `tests/tokenizer.rs` | 18 | exact conformance to Meta's published token ids, hostile headers, raw-byte decode, byte fallback, round trips |
+| `tests/engine.rs` | 22 | causality, determinism, BOS termination, `State::reset` equivalence, config-mismatch rejection, `State::new` overflow/zero-field rejection, `argmax` totality on empty/NaN, `generate` NaN rejection |
 
 But a passing suite only says the tests agree with the code. It does not say
 they can *notice* disagreement, so `reference/mutation_check_tests.py` injects 21
-realistic bugs one at a time and requires `cargo test` to fail on every one.
-**21/21 caught.** It is the same discipline as `mutation_check.py`, pointed at
-the other half of the project: that one proves the differential harness can
-fail, this one proves the Rust tests can.
+realistic bugs one at a time into a minimal temporary copy of the crate and
+requires every mutant to **compile cleanly** (`cargo test --offline --locked --no-run`)
+and then fail at least one named test (`test ... FAILED`) inside a 60-second
+timeout. Compile errors, timeouts, signals, and zero-test-failed exits are all
+harness failures rather than false "caught" counts. **21/21 caught.** It is the
+same discipline as `mutation_check.py`, pointed at the other half of the
+project: that one proves the differential harness can fail, this one proves the
+Rust tests can.
 
 Running it found two genuine blind spots, both of which were real holes in the
 suite rather than in the mutants:
@@ -147,17 +152,19 @@ red. This is the inventory:
 
 | check | how it was shown to fail |
 |---|---|
-| `diff_test.py` (6 configs) | 10 injected bugs, `mutation_check.py`, 10/10 |
-| `cargo test` (75 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 |
+| `diff_test.py` (6 configs) | 10 injected bugs, `mutation_check.py`, 10/10 (requires a named `FAIL` config; crashes and harness errors are rejected) |
+| `cargo test` (84 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 (requires `--no-run` compile success plus at least one `test ... FAILED`; syntax errors fail as `COMPILE_ERROR`) |
 | byte-identical greedy output | a RoPE-less mutant binary: `bench.py` reports `DIFFERENT` and exits 1 |
-| zero-dependency assertion | a `Cargo.lock` with a second package, with zero packages, and naming a package that is not `proofinfer` — all three rejected |
-| `verus/check_citations.py` | GQA mapping mutated in place, nine lines inserted to shift every citation, attention window changed, a cache write deleted; plus a missing source file, an unregistered citation, and a rotted table entry |
+| zero-dependency & lockfile v3 assertion | a `Cargo.lock` with a second package, with zero packages, naming another package, or upgraded past `version = 3` — all rejected |
+| `reference/check_provenance.py` | 1-byte flip in a vendored file and an unlisted extra file in a scratch copy — both rejected |
+| `verus/check_citations.py` | built-in `--self-test` mutates `src/` upper slice bounds, `checked_mul(kv_dim)`, line/block comments, string-literal spoofing, token-boundary prefix (`0` -> `0x1`), `layer_end`, and weakens an `exec_*` slice in `verus/kv_cache_bounds.rs` — 8/8 rejected in CI |
 | CI workflow wiring | every `steps.<id>.outputs.<name>` resolves to a step that writes it, every `run:` block parses as bash, no `\|\| true` outside comments |
 | Verus itself | `--no-cheating` rejects `assume` / `admit` / `external_body`; the unmutated baseline is run first so "24 verified" cannot mean "the file does not parse" |
 
 The full-run commands are in the repository, not just in a shell history:
-`reference/mutation_check.py`, `reference/mutation_check_tests.py`, and
-`verus/check_citations.py` all exit non-zero on failure and all run in CI.
+`reference/mutation_check.py`, `reference/mutation_check_tests.py`,
+`reference/check_provenance.py`, and `verus/check_citations.py` all exit
+non-zero on failure and all run in CI.
 
 ### Why the differential test is worth anything
 

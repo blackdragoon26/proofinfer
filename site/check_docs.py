@@ -17,12 +17,10 @@ import sys
 from pathlib import Path
 
 SITE = Path(__file__).resolve().parent
-REPO = SITE.parent.parent / "tinyinfer"
-PAIRS = [
-    ("testing.md", "testing.html"),
-    ("performance.md", "performance.html"),
-    ("design.md", "design.html"),
-]
+REPO = SITE.parent
+if str(SITE) not in sys.path:
+    sys.path.insert(0, str(SITE))
+from sync import PAGES  # noqa: E402
 
 # Code-ish tokens: identifiers, numbers with exponents and signs, paths,
 # operators. "|" is dropped on both sides because it is table punctuation in the
@@ -61,7 +59,7 @@ def md_tokens(path: Path) -> list[str]:
         s = re.sub(r"^#{1,6}\s+", "", line.strip())
         # A list marker is structure, not prose: <ol> renders "1." through CSS
         # and the marker never appears in the page's text.
-        s = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", line)
+        s = re.sub(r"^\s*(?:[-*]|\d+\.)\s+", "", s)
         s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)  # link -> its label
         s = s.replace("**", "").replace("`", "")
         s = re.sub(r"(?<![\w*])\*([^*\s][^*]*)\*(?![\w*])", r"\1", s)  # *emphasis*
@@ -91,7 +89,7 @@ def first_diff(a: list[str], b: list[str]) -> str:
 
 def main() -> int:
     failures = 0
-    for md_name, html_name in PAIRS:
+    for md_name, html_name, _title in PAGES:
         a = md_tokens(REPO / "docs" / md_name)
         b = html_tokens(SITE / html_name)
         if a == b:

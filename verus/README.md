@@ -9,6 +9,8 @@ CONTEXT.md section 10, question 7:
 - `kv_cache_bounds.rs` — the Verus development. **24 verification conditions,
   all discharged by Verus.** See "Verification status" below for the exact
   command and its real output.
+- `check_citations.py` — bidirectional, symbol-scoped citation verifier tying
+  this document and `kv_cache_bounds.rs` to `src/ops.rs` and `src/model.rs`.
 - This file — what is proved, where it lands in the Rust source, what is
   *not* proved, and how to re-run the check.
 
@@ -27,13 +29,12 @@ actually performs: `n_layers > 0`, `n_heads > 0`, `n_kv_heads > 0`,
 `seq_len > 0`, `head_size > 0`, and `n_heads % n_kv_heads == 0`.
 
 **Claim 1 — the shapes follow from the loader.**
-`lemma_shapes_from_config` shows that anything passing `Config::validate`
-(model.rs:123-144) and `AttentionDims::try_new` (ops.rs:315-345) yields a shape
-tuple satisfying the preconditions above. The only non-obvious part is
+`lemma_shapes_from_config` shows that anything passing
+`model.rs::Config::validate` and `ops.rs::AttentionDims::try_new` yields a
+shape tuple satisfying the preconditions above. The only non-obvious part is
 `head_size > 0`, which the loader never checks explicitly: it computes
-`head_size = dim / n_heads` (ops.rs:334) only after rejecting `dim == 0`
-(ops.rs:321-323) and `dim % n_heads != 0` (ops.rs:324-326), and a divisor of a
-positive number is positive.
+`head_size = dim / n_heads` only after rejecting `dim == 0` and
+`dim % n_heads != 0`, and a divisor of a positive number is positive.
 
 **Claim 2 — the attention read is in bounds** (`lemma_attention_row_in_layer`).
 For every `t` with `0 <= t <= pos` and every `kv` with `kv < n_kv_heads`:
@@ -66,32 +67,35 @@ bound with the layer offset folded in, which is the form the CONTEXT.md
 question is phrased in.
 
 **Claim 5 — the remaining index expressions.**
-`lemma_query_head_in_q` (`&q[h*head_size..(h+1)*head_size]`, ops.rs:429) and
-`&mut out[h*head_size..(h+1)*head_size]`, ops.rs:440) and
-`lemma_scores_window_in_scratch` (`&mut scores[..limit]`, ops.rs:430).
+`lemma_query_head_in_q` (`&q[h*head_size..(h+1)*head_size]` and
+`&mut out[h*head_size..(h+1)*head_size]` in `ops.rs::attention`) and
+`lemma_scores_window_in_scratch` (`&mut scores[..limit]` in `ops.rs::attention`).
 
 ## 2. Where each claim lands in the Rust source
 
-Line numbers are against commit `efef84b`.
+Citations are symbol-scoped rather than line-numbered and are verified
+bidirectionally against both `src/` and `verus/kv_cache_bounds.rs` by
+`verus/check_citations.py`.
 
-| Rust | Expression | Verus |
+| Rust symbol | Expression | Verus |
 |---|---|---|
-| ops.rs:429, 440 | `&q[h*head_size..(h+1)*head_size]`, `&mut out[h*head_size..(h+1)*head_size]` | `lemma_query_head_in_q` |
-| ops.rs:430 | `&mut scores[..limit]` | `lemma_scores_window_in_scratch` |
-| ops.rs:433 | `&key_cache[t*kv_dim + kv*head_size .. t*kv_dim + (kv+1)*head_size]` | `lemma_attention_row_in_layer` |
-| ops.rs:443-444 | `&value_cache[t*kv_dim + kv*head_size .. t*kv_dim + (kv+1)*head_size]` | `lemma_attention_row_in_layer` (identical shape) |
-| ops.rs:428 | `let kv = h / kv_mul` | `lemma_gqa_head_in_range` |
-| ops.rs:422 | `let limit = pos + 1` | `lemma_limit_rows_fit_in_layer` |
-| ops.rs:423-425 | the `debug_assert!`s on buffer lengths | the `requires` of `exec_attention_read` |
-| ops.rs:350-352 / 356-358 / 362-364 | `kv_dim` / `kv_mul` / `q_dim` | `Shapes::kv_dim`, `kv_mul`, `q_dim` |
-| ops.rs:315-345 | `AttentionDims::try_new` | `Shapes::valid`, `lemma_shapes_from_config` |
-| model.rs:682 | `let kv_layer_stride = cfg.seq_len * kv_dim` | `Shapes::kv_layer_stride` |
-| model.rs:711-713 | `let base = l*stride + pos*kv_dim; key_cache[base..base+kv_dim]` | `lemma_cache_write_in_cache` |
-| model.rs:718-719, 723-724 | `layer_start`/`layer_end`, `&self.key_cache[layer_start..layer_end]` | `lemma_layer_slice_in_cache` |
-| model.rs:671-676 | `if pos >= cfg.seq_len { return Err(..) }` | the `pos < seq_len` hypothesis everywhere |
-| model.rs:603-607, 619-621 | the `checked_mul` cache size and the allocations | the overflow preconditions of the `exec fn`s |
+| `ops.rs::attention` | `&q[h*head_size..(h+1)*head_size]`, `&mut out[h*head_size..(h+1)*head_size]` | `lemma_query_head_in_q`, `exec_attention_read` |
+| `ops.rs::attention` | `&mut scores[..limit]` | `lemma_scores_window_in_scratch`, `exec_attention_read` |
+| `ops.rs::attention` | `&key_cache[t*kv_dim + kv*head_size .. t*kv_dim + (kv+1)*head_size]` | `lemma_attention_row_in_layer`, `exec_attention_read` |
+| `ops.rs::attention` | `&value_cache[t*kv_dim + kv*head_size .. t*kv_dim + (kv+1)*head_size]` | `lemma_attention_row_in_layer`, `exec_attention_read` |
+| `ops.rs::attention` | `let kv = h / kv_mul` | `lemma_gqa_head_in_range`, `exec_attention_read` |
+| `ops.rs::attention` | `let limit = pos + 1` | `lemma_limit_rows_fit_in_layer`, `exec_attention_read` |
+| `ops.rs::attention` | `debug_assert!`s on buffer lengths | the `requires` of `exec_attention_read` |
+| `ops.rs::AttentionDims::kv_dim` / `ops.rs::AttentionDims::kv_mul` / `ops.rs::AttentionDims::q_dim` | `kv_dim` / `kv_mul` / `q_dim` | `Shapes::kv_dim`, `kv_mul`, `q_dim` |
+| `ops.rs::AttentionDims::try_new` | shape validation checks | `Shapes::valid`, `lemma_shapes_from_config` |
+| `model.rs::Config::validate` | non-zero config checks + `attention_dims()` | `Shapes::valid`, `lemma_shapes_from_config` |
+| `model.rs::State::forward` | `let kv_layer_stride = cfg.seq_len * kv_dim` | `Shapes::kv_layer_stride`, `exec_forward_cache_write_and_layer_slice` |
+| `model.rs::State::forward` | `let base = l*stride + pos*kv_dim; key_cache/value_cache[base..base+kv_dim]` | `lemma_cache_write_in_cache`, `exec_forward_cache_write_and_layer_slice` |
+| `model.rs::State::forward` | `layer_start`/`layer_end`, `&self.key_cache[layer_start..layer_end]` / `&self.value_cache[layer_start..layer_end]` | `lemma_layer_slice_in_cache`, `exec_forward_cache_write_and_layer_slice` |
+| `model.rs::State::forward` | `if pos >= cfg.seq_len { return Err(..) }` | the `pos < seq_len` hypothesis everywhere |
+| `model.rs::State::new` | `checked_mul` cache size and `try_zeroed_f32_vec` allocations | the overflow preconditions of the `exec fn`s |
 
-Sections 7 of `kv_cache_bounds.rs` go one step further: `exec_attention_read`
+Section 7 of `kv_cache_bounds.rs` goes one step further: `exec_attention_read`
 and `exec_forward_cache_write_and_layer_slice` are `exec fn`s containing the
 index expressions **copied verbatim** from the table above, operating on real
 `Vec<f32>`. Verus discharges the genuine slice-indexing obligations there,
@@ -119,30 +123,35 @@ claiming otherwise.**
    `src/model.rs` contain no `verus!` macro and are not compiled by Verus. The
    development is a *separate model file*. To verify the crate itself you would
    need `vargo` and to annotate the real functions; that was not attempted.
-2. **The correspondence between the model and the code is manual.** The
-   `Shapes` preconditions and the `exec fn` bodies were transcribed by a human.
-   If someone changed the loader's checks, or changed an index expression in
-   `src/ops.rs`, **this file would keep verifying.** It would simply be
-   describing the old code. This is the single most important caveat: the proof
+2. **The correspondence between the model and the code is manual, bounded by
+   a syntactic citation check.** The `Shapes` preconditions and the `exec fn`
+   bodies were transcribed by a human. If someone changed the control flow or
+   context around an expression without changing the cited text, **this file
+   would keep verifying.** This is the single most important caveat: the proof
    is a proof *about a transcription*.
 
-   The link is now partly machine-checked. `verus/check_citations.py` verifies
-   that every source line cited in this file and in `kv_cache_bounds.rs` still
-   contains the construct it is cited for, and CI runs it before Verus. So
-   changing `h / kv_mul`, or refactoring in a way that shifts the line numbers,
-   turns the build red instead of leaving a stale claim. What that check does
-   *not* do is verify the reasoning: an edit that preserves a cited
-   expression's text but changes what it computes elsewhere, or a gap in which
-   expressions were transcribed at all, would still pass.
+   `verus/check_citations.py` closes the syntactic drift mode on *both* sides:
+   it tokenizes Rust code (skipping `//` and nested `/* ... */` comments,
+   treating string literals as atomic tokens so string text cannot satisfy a
+   code check, and matching on full token boundaries), resolves each symbol
+   cited in this file and in `kv_cache_bounds.rs`, asserts every required token
+   sequence (including full lower and upper slice bounds and `checked_mul`
+   chains) appears in `src/` and in the paired `exec_*` body in
+   `verus/kv_cache_bounds.rs`, and runs `--self-test` in CI to prove mutations
+   on either side fail. What that check does *not* do is verify semantic
+   equivalence across un-cited code: an edit that preserves a cited expression's
+   tokens while altering how variables are initialized elsewhere, or a gap in
+   which expressions were transcribed at all, would still pass.
 3. **The loader's `checked_mul` is assumed, not proved.** The overflow
    preconditions in the `exec fn`s (`head_size * n_kv_heads <= usize::MAX`,
    `(n_layers * seq_len) * (head_size * n_kv_heads) <= usize::MAX`,
-   model.rs:603-607) are taken as `requires`. Nothing here shows that
-   `checked_tensor_len` (model.rs:249-253) or `State::new` really do return
+   `model.rs::State::new`) are taken as `requires`. Nothing here shows that
+   `model.rs::checked_tensor_len` or `model.rs::State::new` really do return
    `Err` rather than wrap.
-4. **The `pos < seq_len` guard is assumed, not proved.** model.rs:671-676 is
-   read as a precondition of `forward`, and the proof is conditional on it.
-5. **The `debug_assert!`s at ops.rs:423-425 are compiled out in release.**
+4. **The `pos < seq_len` guard is assumed, not proved.**
+   `model.rs::State::forward`'s guard is read as a precondition of `forward`,
+   and the proof is conditional on it.
+5. **The `debug_assert!`s in `ops.rs::attention` are compiled out in release.**
    They are *not* what makes the code safe. The safety argument is the
    arithmetic in `lemma_limit_rows_fit_in_layer` plus
    `lemma_layer_slice_in_cache`: a layer slice is `seq_len * kv_dim` long, and
@@ -171,34 +180,56 @@ claiming otherwise.**
    `lemma_gqa_head_in_range` is about totality of the mapping, not about it
    being the *right* mapping.
 10. **Order of positions is not modelled.** That positions must be fed
-    `0, 1, 2, ...` in order is a caller obligation (model.rs:658-662), not a
-    checked precondition. A hole left by feeding position 7 before position 3
-    reads as zeros and is perfectly in bounds.
+    `0, 1, 2, ...` in order is a caller obligation
+    (`model.rs::State::forward@doc`), not a checked precondition. A hole left
+    by feeding position 7 before position 3 reads as zeros and is perfectly in
+    bounds.
 11. **Bounds safety is not memory safety.** Nothing here covers use-after-free,
     aliasing, or anything the Rust compiler does not already cover.
 
 ## 4. Reproducing the check
 
-Verus is not a dependency of this crate and is not vendored. It was obtained
-as a prebuilt release; `cargo install vargo` was **not** needed.
+Verus is not a dependency of this crate and is not vendored. It is obtained as
+a prebuilt release; `cargo install vargo` is **not** needed.
+
+### Linux x86_64 (matching CI)
+
+```sh
+# 1. Prebuilt Verus for Linux/x86_64 (~485 MB).
+curl -fSL -o verus-x86-linux.zip \
+  'https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-x86-linux.zip'
+echo '7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33  verus-x86-linux.zip' \
+  | sha256sum --check --strict -
+unzip -q verus-x86-linux.zip -d verus-dist
+
+# 2. Verus requires a matching rustc (1.98.1 for this release).
+#    Using an isolated RUSTUP_HOME keeps your host toolchain untouched:
+RUSTUP_HOME="$PWD/.verus-rustup" rustup toolchain install 1.98.1-x86_64-unknown-linux-gnu
+
+# 3. Check citations (including self-test) and run Verus:
+python3 verus/check_citations.py --self-test
+python3 verus/check_citations.py
+RUSTUP_HOME="$PWD/.verus-rustup" ./verus-dist/verus-x86-linux/verus \
+  --crate-type lib --no-cheating verus/kv_cache_bounds.rs
+```
+
+### macOS arm64
 
 ```sh
 # 1. Prebuilt Verus for macOS/arm64 (449 MB).
-curl -L -o verus-arm64-macos.zip \
+curl -fSL -o verus-arm64-macos.zip \
   'https://github.com/verus-lang/verus/releases/download/release%2F0.2026.09.20.aef82ed/verus-0.2026.09.20.aef82ed-arm64-macos.zip'
-shasum -a 256 verus-arm64-macos.zip
-# 3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc
-unzip -q verus-arm64-macos.zip
+echo '3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc  verus-arm64-macos.zip' \
+  | shasum -a 256 --check -
+unzip -q verus-arm64-macos.zip -d verus-dist
 
-# 2. Verus requires a matching rustc. This release wants 1.98.1.
-#    Installing it into a scratch RUSTUP_HOME keeps your own toolchain untouched:
-RUSTUP_HOME=$HOME/.jcode/scratch/rustup CARGO_HOME=$HOME/.jcode/scratch/cargo \
-  rustup toolchain install 1.98.1-aarch64-apple-darwin
+# 2. Install the matching rustc into an isolated RUSTUP_HOME:
+RUSTUP_HOME="$PWD/.verus-rustup" rustup toolchain install 1.98.1-aarch64-apple-darwin
 
-# 3. Run the verifier on the model file.
-cd /path/to/proofinfer
-RUSTUP_HOME=$HOME/.jcode/scratch/rustup CARGO_HOME=$HOME/.jcode/scratch/cargo \
-  "$HOME/.jcode/scratch/verus-dl/verus-arm64-macos/verus" \
+# 3. Check citations and run Verus:
+python3 verus/check_citations.py --self-test
+python3 verus/check_citations.py
+RUSTUP_HOME="$PWD/.verus-rustup" ./verus-dist/verus-arm64-macos/verus \
   --crate-type lib --no-cheating verus/kv_cache_bounds.rs
 ```
 
@@ -216,8 +247,8 @@ $ verus --version
 Verus
   Version: 0.2026.09.20.aef82ed
   Profile: release
-  Platform: macos_aarch64
-  Toolchain: 1.98.1-aarch64-apple-darwin
+  Platform: linux_x86_64
+  Toolchain: 1.98.1-x86_64-unknown-linux-gnu
 
 $ verus --crate-type lib --no-cheating verus/kv_cache_bounds.rs
 verification results:: 24 verified, 0 errors
@@ -225,16 +256,15 @@ $ echo $?
 0
 ```
 
-- Verus `0.2026.09.20.aef82ed`, prebuilt arm64-macOS release, sha256
-  `3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc`.
-- rustc `1.98.1-aarch64-apple-darwin`, installed into a scratch `RUSTUP_HOME`.
-  The machine's default toolchain is `1.98.0` and was not modified; no
-  `vargo`, no `cargo install`, nothing added to `Cargo.toml` or `Cargo.lock`.
-- Repo commit `efef84b`. The source line numbers were re-derived against this
-  commit: commit `efef84b` landed mid-task and shifted `src/ops.rs` by 8
-  lines, and every reference above was corrected afterwards. The `attention`
-  body itself is unchanged, only its line numbers moved.
-- Wall clock for the verification itself: about 0.8 s.
+- Verus `0.2026.09.20.aef82ed`, prebuilt x86-linux release, sha256
+  `7b870fa12bc589015c2fab60a8b3d9f07c7b1adb3444eb0fadffcbf7f0447b33` (and
+  arm64-macOS sha256
+  `3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc`).
+- rustc `1.98.1`, installed into an isolated `RUSTUP_HOME`. No `vargo`, no
+  `cargo install`, nothing added to `Cargo.toml` or `Cargo.lock`.
+- `verus/check_citations.py --self-test` and `verus/check_citations.py` both
+  pass, verifying symbol-scoped expressions across both `src/` and
+  `verus/kv_cache_bounds.rs`.
 - `grep` finds no `assume`, `admit`, or `external_body` in the file, and
   `--no-cheating` passes, which is the stronger of the two claims.
 
@@ -243,6 +273,7 @@ conditions passed, covering the five claims in section 1. That is a proof about
 the model in `kv_cache_bounds.rs` and about the real slice expressions
 transcribed into its section 7. It is not a proof about the compiled
 `src/ops.rs` or `src/model.rs`, and section 3 lists what that excludes. The
-honest one-line summary: **the indexing arithmetic is machine-checked; the
-link from that arithmetic to the current contents of `src/` is a human
-transcription that no tool here is checking.**
+honest one-line summary: **the indexing arithmetic is machine-checked by Verus,
+and `verus/check_citations.py` checks that every cited `src/` and `exec_*`
+expression still matches textually; semantic equivalence across un-cited code
+remains a manual correspondence.**

@@ -38,6 +38,7 @@ import argparse
 import contextlib
 import dataclasses
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -319,7 +320,11 @@ def run_random_config(cfg: Config, binary: Path, seed: int) -> Result:
 
 
 def run_real_checkpoint(
-    binary: Path, checkpoint: Path, n: int, workdir: Path
+    binary: Path,
+    checkpoint: Path,
+    n: int,
+    workdir: Path,
+    export_bin: Optional[Path] = None,
 ) -> Result:
     """Compare against a genuinely trained checkpoint.
 
@@ -380,7 +385,19 @@ def run_real_checkpoint(
     idx = torch.tensor([tokens], dtype=torch.long)
     ref = reference_logits(model, idx)
 
-    legacy = workdir / f"{checkpoint.stem}.bin"
+    if export_bin is not None:
+        ckpt_resolved = checkpoint.resolve()
+        exp_resolved = export_bin.resolve()
+        same_target = exp_resolved == ckpt_resolved
+        if not same_target and exp_resolved.exists() and ckpt_resolved.exists():
+            same_target = os.path.samefile(exp_resolved, ckpt_resolved)
+        if same_target:
+            raise RuntimeError(
+                f"--export-bin ({export_bin}) resolves to the same file as "
+                f"--checkpoint ({checkpoint}); refusing to overwrite the input checkpoint"
+            )
+    legacy = export_bin.resolve() if export_bin else workdir / f"{checkpoint.stem}.bin"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
     with contextlib.redirect_stdout(io.StringIO()):
         legacy_export(model, str(legacy))
     got = run_engine(binary, legacy, tokens, workdir / f"{checkpoint.stem}.f32")
@@ -437,6 +454,11 @@ def main() -> int:
         default=200,
         help="with --checkpoint, how many tokens to greedy-decode",
     )
+    parser.add_argument(
+        "--export-bin",
+        type=Path,
+        help="with --checkpoint, also save the exported legacy .bin checkpoint at this path",
+    )
     args = parser.parse_args()
 
     binary = args.binary.resolve()
@@ -448,6 +470,10 @@ def main() -> int:
         )
         return 2
 
+    if args.export_bin and not args.checkpoint:
+        print("error: --export-bin requires --checkpoint", file=sys.stderr)
+        return 2
+
     with tempfile.TemporaryDirectory() as tmp:
         workdir = Path(tmp)
 
@@ -456,7 +482,9 @@ def main() -> int:
                 print(f"error: no such checkpoint: {args.checkpoint}", file=sys.stderr)
                 return 2
             print(f"real-weight mode: {args.checkpoint}")
-            results = [run_real_checkpoint(binary, args.checkpoint, args.n, workdir)]
+            results = [
+                run_real_checkpoint(binary, args.checkpoint, args.n, workdir, args.export_bin)
+            ]
         else:
             selected = CONFIGS
             if args.config:

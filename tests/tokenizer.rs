@@ -323,7 +323,7 @@ fn a_wrong_vocab_size_is_caught_either_way() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("reference/llama2c/tokenizer.bin");
     let data = std::fs::read(&path).unwrap();
 
-    assert!(Tokenizer::from_bytes(&data, 100).is_err(), "too few tokens");
+    assert!(Tokenizer::from_bytes(&data, 300).is_err(), "too few tokens");
     assert!(
         Tokenizer::from_bytes(&data, LLAMA2_VOCAB_SIZE + 1).is_err(),
         "too many tokens"
@@ -336,7 +336,10 @@ fn a_wrong_vocab_size_is_caught_either_way() {
 
 #[test]
 fn random_bytes_never_panic_the_vocabulary_parser() {
-    // Same totality contract as the checkpoint loader.
+    // Same totality contract as the checkpoint loader. Use vocab_size >= 259
+    // and buffers large enough to pass the minimum-table-size check on half
+    // the iterations, with a valid max_token_length header spliced in front so
+    // the record-parsing loop is genuinely exercised.
     let mut state = 0x2468_1357u32;
     let mut next = move || {
         state ^= state << 13;
@@ -344,10 +347,133 @@ fn random_bytes_never_panic_the_vocabulary_parser() {
         state ^= state << 5;
         state
     };
+    let mut reached_record_loop = 0usize;
     for i in 0..500usize {
-        let len = (i * 13) % 2048;
-        let buf: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
-        let vocab_size = 1 + (i % 64);
-        let _ = Tokenizer::from_bytes(&buf, vocab_size);
+        let vocab_size = 259 + (i % 64);
+        let len = if i % 2 == 0 {
+            4 + vocab_size * 8 + (i * 17) % 1024
+        } else {
+            (i * 13) % 2048
+        };
+        let mut buf: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
+        if i % 2 == 0 {
+            // Plausible positive max_token_length so parsing enters the loop.
+            buf[..4].copy_from_slice(&32i32.to_le_bytes());
+        }
+        let res = Tokenizer::from_bytes(&buf, vocab_size);
+        if i % 2 == 0 {
+            match &res {
+                Err(proofinfer::tokenizer::TokenizerError::InvalidFormat(m))
+                    if m.contains("negative token length") =>
+                {
+                    reached_record_loop += 1;
+                }
+                Err(proofinfer::tokenizer::TokenizerError::Overflow {
+                    what: "vocab entry length",
+                })
+                | Err(proofinfer::tokenizer::TokenizerError::Truncated {
+                    what: "vocab bytes",
+                    ..
+                }) => {
+                    reached_record_loop += 1;
+                }
+                _ => {}
+            }
+        }
     }
+    assert!(
+        reached_record_loop > 100,
+        "fuzz sweep must actually reach record parsing, reached only {reached_record_loop}"
+    );
+}
+
+/// Build a minimal valid synthetic vocabulary with `vocab_size >= 259` and a
+/// caller-chosen `max_token_length` header.
+fn build_synthetic_vocab(vocab_size: usize, max_token_length: i32) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&max_token_length.to_le_bytes());
+    for id in 0..vocab_size {
+        data.extend_from_slice(&0.0f32.to_le_bytes());
+        let piece: Vec<u8> = if id == 0 {
+            b"<unk>".to_vec()
+        } else if id == 1 {
+            b"\n<s>\n".to_vec()
+        } else if id == 2 {
+            b"\n</s>\n".to_vec()
+        } else if id < 259 {
+            format!("<0x{:02X}>", id - 3).into_bytes()
+        } else if id == 259 {
+            b" ".to_vec()
+        } else {
+            format!("t{id}").into_bytes()
+        };
+        data.extend_from_slice(&(piece.len() as i32).to_le_bytes());
+        data.extend_from_slice(&piece);
+    }
+    data
+}
+
+#[test]
+fn hostile_tokenizer_headers_are_rejected_without_panic_or_oom() {
+    use proofinfer::tokenizer::TokenizerError;
+
+    // vocab_size < 259 cannot hold specials + 256 byte-fallback tokens.
+    let small = build_synthetic_vocab(260, 16);
+    assert!(matches!(
+        Tokenizer::from_bytes(&small, 100),
+        Err(TokenizerError::InvalidFormat(_))
+    ));
+    assert!(matches!(
+        Tokenizer::from_bytes(&small, 258),
+        Err(TokenizerError::InvalidFormat(_))
+    ));
+
+    // Negative max_token_length must be rejected (never wrapped to usize::MAX).
+    for neg in [-1i32, i32::MIN] {
+        let bad = build_synthetic_vocab(260, neg);
+        assert!(
+            matches!(
+                Tokenizer::from_bytes(&bad, 260),
+                Err(TokenizerError::InvalidFormat(_))
+            ),
+            "max_token_length={neg} must fail with InvalidFormat"
+        );
+    }
+
+    // Huge vocab_size on a tiny buffer must fail before allocation.
+    let tiny = [16i32.to_le_bytes().as_slice(), &[0u8; 64]].concat();
+    assert!(matches!(
+        Tokenizer::from_bytes(&tiny, u32::MAX as usize),
+        Err(TokenizerError::Truncated { .. }) | Err(TokenizerError::Overflow { .. })
+    ));
+
+    // Negative record length returns InvalidFormat rather than Truncated(usize::MAX).
+    let mut neg_len = Vec::new();
+    neg_len.extend_from_slice(&16i32.to_le_bytes());
+    neg_len.extend_from_slice(&0.0f32.to_le_bytes());
+    neg_len.extend_from_slice(&(-5i32).to_le_bytes());
+    neg_len.resize(4 + 260 * 8, 0);
+    assert!(matches!(
+        Tokenizer::from_bytes(&neg_len, 260),
+        Err(TokenizerError::InvalidFormat(_))
+    ));
+
+    // Huge positive max_token_length on a valid small vocabulary must not OOM in encode.
+    let huge_max = build_synthetic_vocab(260, i32::MAX);
+    let tok = Tokenizer::from_bytes(&huge_max, 260).expect("valid small vocab with large header");
+    let ids = tok.encode("hi", true, false);
+    assert!(!ids.is_empty());
+}
+
+#[test]
+fn decode_one_bytes_preserves_raw_non_ascii_byte_fallback_tokens() {
+    let t = tokenizer();
+    for b in [0x80u8, 0xc3, 0xff] {
+        let id = u32::from(b) + 3;
+        assert_eq!(t.decode_one_bytes(None, id), vec![b]);
+        // String form remains lossy UTF-8 for backward compatibility.
+        assert_eq!(t.decode_one(None, id), "\u{FFFD}");
+    }
+    // Out-of-range id returns empty bytes without panicking.
+    assert!(t.decode_one_bytes(None, u32::MAX).is_empty());
 }

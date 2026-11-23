@@ -29,12 +29,14 @@ proofinfer/
     mutation_check.py        proves the differential harness can fail
     mutation_check_tests.py  proves the Rust test suite can fail
     bench.py                 benchmark + byte-identity check
+    check_provenance.py      verifies vendored llama2c sha256s + byte sizes
+    requirements.txt         pinned CPU PyTorch/numpy CI dependencies
     llama2c/                 vendored UNMODIFIED from karpathy/llama2.c (MIT)
   verus/                     Verus proof of KV-cache index safety (24 conditions,
                              machine-checked; see its README for the scope)
-                             plus check_citations.py, which keeps the proof
-                             from silently drifting away from src/
-  .github/workflows/ci.yml   four jobs, no `|| true`, no continue-on-error
+                             plus check_citations.py, which checks symbol-scoped
+                             expressions across both src/ and verus/
+  .github/workflows/ci.yml   six jobs, no `|| true`, no continue-on-error
 ```
 
 
@@ -119,21 +121,23 @@ A green Verus run is not enough on its own, because the proof verifies a
 verifying, faithfully, about code that no longer exists — and the green tick
 would be actively misleading.
 
-So `verus/check_citations.py` checks the link. Every source line the proof and
-its README cite must still contain the construct it is cited for. It is
-bidirectional — an uncited citation and an unused expectation are both failures,
-so neither the prose nor the table can quietly stop being checked. Stdlib only,
-so it costs nothing in CI.
+So `verus/check_citations.py` checks the link in both directions. Every symbol
+the proof and its README cite (`ops.rs::attention`, `model.rs::State::forward`,
+etc.) is resolved in `src/` via a Rust tokenizer (skipping `//` and nested
+`/* ... */` comments, treating string literals as atomic tokens so string
+contents cannot satisfy code checks, and matching on full token boundaries) and
+checked for every required expression — including full lower and upper slice
+bounds and `checked_mul` chains. Paired entries are checked against the
+`exec_*` bodies in `verus/kv_cache_bounds.rs` too, so weakening the Verus side
+fails just like drifting `src/`. Prose<->registry coverage is bidirectional,
+and `--self-test` runs in-memory mutations across both files in CI. Stdlib
+only, so it costs nothing.
 
-The check has been negative-tested, which matters more than it passing: it goes
-red when the GQA mapping is mutated in place, when an unrelated edit shifts the
-line numbers, when the attention window changes, and when a cache write is
-deleted from `forward`.
-
-What it still does not check is the reasoning. An edit that preserves a cited
-expression's text while changing what it computes elsewhere would pass, as would
-a gap in which expressions were transcribed at all. It is a tripwire on the
-likely accident, not a proof of correspondence.
+What it still does not check is semantic equivalence across un-cited code. An
+edit that preserves a cited expression's text while changing how its inputs are
+initialized elsewhere would pass, as would a gap in which expressions were
+transcribed at all. It is a cross-file syntactic tripwire on the likely
+accidents, not a proof of correspondence.
 
 #### What is **not** proved
 

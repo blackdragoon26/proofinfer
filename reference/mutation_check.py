@@ -165,8 +165,22 @@ class Outcome:
     seconds: float
 
 
-def run(cmd: list[str], cwd: Path, env: dict[str, str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
+def run(
+    cmd: list[str], cwd: Path, env: dict[str, str], timeout: int = 120
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+
+
+_LAST_MTIME = 0.0
+
+
+def write_and_bump_mtime(path: Path, content: str) -> None:
+    """Write `content` and advance mtime monotonically so Cargo never skips a rebuild."""
+    global _LAST_MTIME
+    path.write_text(content)
+    now = max(time.time(), _LAST_MTIME + 1.1)
+    os.utime(path, (now, now))
+    _LAST_MTIME = now
 
 
 def engine_binary(target: Path) -> Path:
@@ -182,7 +196,7 @@ def engine_binary(target: Path) -> Path:
 
 def check_baseline(crate: Path, target: Path, env: dict[str, str]) -> tuple[bool, str]:
     """Build and test the unmutated source. It has to pass first."""
-    build = run(["cargo", "build", "--release"], crate, env)
+    build = run(["cargo", "build", "--release", "--offline", "--locked"], crate, env, timeout=180)
     if build.returncode != 0:
         return False, f"baseline build failed:\n{build.stderr.strip()}"
     diff = run(
@@ -194,6 +208,7 @@ def check_baseline(crate: Path, target: Path, env: dict[str, str]) -> tuple[bool
         ],
         REPO,
         env,
+        timeout=180,
     )
     if diff.returncode != 0:
         return False, f"baseline diff_test failed:\n{diff.stdout[-2000:]}"
@@ -211,6 +226,13 @@ def check_mutant(
     # moved or duplicated a line would turn a mutant into a no-op, the mutant
     # would behave identically to the baseline, and diff_test would exit 0 -
     # indistinguishable, in the output, from "the bug slipped through".
+    if m.new == m.old:
+        return Outcome(
+            m.name,
+            False,
+            "NO_OP: replacement text is identical to original",
+            time.time() - started,
+        )
     count = original.count(m.old)
     if count != 1:
         return Outcome(
@@ -220,18 +242,14 @@ def check_mutant(
             f"(the mutation is not well defined; fix the mutant or the source)",
             time.time() - started,
         )
-    if m.new in original:
-        return Outcome(
-            m.name,
-            False,
-            f"replacement text already present in {m.path}; the mutant would be "
-            f"a no-op",
-            time.time() - started,
-        )
 
-    path.write_text(original.replace(m.old, m.new, 1))
+    write_and_bump_mtime(path, original.replace(m.old, m.new, 1))
     try:
-        build = run(["cargo", "build", "--release"], crate, env)
+        try:
+            build = run(["cargo", "build", "--release", "--offline", "--locked"], crate, env)
+        except subprocess.TimeoutExpired:
+            return Outcome(m.name, False, "TIMEOUT: cargo build timed out", time.time() - started)
+
         if build.returncode != 0:
             # A mutant that does not compile is not a *silent* bug, so it does
             # not prove anything about the harness. Report it as not-caught
@@ -239,22 +257,26 @@ def check_mutant(
             return Outcome(
                 m.name,
                 False,
-                f"mutant did not compile, so the harness never saw it:\n"
+                f"COMPILE_ERROR: mutant did not compile, so the harness never saw it:\n"
                 f"{build.stderr.strip()[-800:]}",
                 time.time() - started,
             )
 
         binary = engine_binary(target)
-        diff = run(
-            [
-                sys.executable,
-                str(REPO / "reference" / "diff_test.py"),
-                "--binary",
-                str(binary),
-            ],
-            REPO,
-            env,
-        )
+        try:
+            diff = run(
+                [
+                    sys.executable,
+                    str(REPO / "reference" / "diff_test.py"),
+                    "--binary",
+                    str(binary),
+                ],
+                REPO,
+                env,
+            )
+        except subprocess.TimeoutExpired:
+            return Outcome(m.name, False, "TIMEOUT: diff_test timed out", time.time() - started)
+
         if diff.returncode == 0:
             return Outcome(
                 m.name,
@@ -263,25 +285,34 @@ def check_mutant(
                 "harness has a blind spot here",
                 time.time() - started,
             )
+        if diff.returncode < 0:
+            return Outcome(
+                m.name,
+                False,
+                f"CRASHED_SIGNAL: diff_test terminated by signal {-diff.returncode}",
+                time.time() - started,
+            )
 
-        # Report exactly which configurations noticed. "it failed" is much less
-        # informative than "the GQA configs noticed and nothing else did", and
-        # the *absence* of a configuration from this list is the interesting
-        # part: it says which bugs that configuration is blind to. So the list
-        # is complete rather than truncated, and the README quotes it verbatim.
+        # Report exactly which configurations noticed. Require at least one
+        # named FAIL configuration line so an unrelated harness crash is never
+        # counted as a caught mutant.
         failed_lines = [
             line.strip()
             for line in diff.stdout.splitlines()
             if line.strip() and "FAIL" in line
         ]
-        detail = "caught"
-        if failed_lines:
-            detail += " by " + ", ".join(f.split()[0] for f in failed_lines)
-        else:
-            detail += " (harness failed without naming a configuration)"
+        if not failed_lines:
+            return Outcome(
+                m.name,
+                False,
+                f"HARNESS_ERROR: diff_test exited {diff.returncode} without naming any FAIL "
+                f"configuration:\n{diff.stderr.strip()[-600:]}",
+                time.time() - started,
+            )
+        detail = "caught by " + ", ".join(f.split()[0] for f in failed_lines)
         return Outcome(m.name, True, detail, time.time() - started)
     finally:
-        path.write_text(original)
+        write_and_bump_mtime(path, original)
 
 
 def main() -> int:

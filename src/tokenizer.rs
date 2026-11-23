@@ -67,6 +67,7 @@ pub enum TokenizerError {
     },
     TrailingBytes(usize),
     Missing(String),
+    InvalidFormat(String),
 }
 
 impl fmt::Display for TokenizerError {
@@ -82,6 +83,7 @@ impl fmt::Display for TokenizerError {
             }
             TokenizerError::TrailingBytes(n) => write!(f, "{n} unexpected trailing bytes"),
             TokenizerError::Missing(what) => write!(f, "vocabulary is missing {what}"),
+            TokenizerError::InvalidFormat(msg) => write!(f, "invalid tokenizer format: {msg}"),
         }
     }
 }
@@ -135,6 +137,19 @@ impl Tokenizer {
     /// `vocab_size` is the number of token records to read; see
     /// [`LLAMA2_VOCAB_SIZE`] for why the format does not tell us.
     pub fn from_bytes(data: &[u8], vocab_size: usize) -> Result<Self, TokenizerError> {
+        const MIN_VOCAB_SIZE: usize = BYTE_ID_OFFSET as usize + 256;
+        if vocab_size < MIN_VOCAB_SIZE {
+            return Err(TokenizerError::InvalidFormat(format!(
+                "vocab_size ({vocab_size}) must be at least {MIN_VOCAB_SIZE} to cover special \
+                 tokens and byte fallbacks"
+            )));
+        }
+        if u32::try_from(vocab_size).is_err() {
+            return Err(TokenizerError::InvalidFormat(format!(
+                "vocab_size ({vocab_size}) exceeds u32::MAX"
+            )));
+        }
+
         let mut pos = 0usize;
         // A closure taking the cursor as an argument rather than capturing it
         // mutably. The cursor is an ordinary local, so threading it through
@@ -154,8 +169,28 @@ impl Tokenizer {
                 Ok(s)
             };
 
-        let max_token_length =
-            i32::from_le_bytes(take(&mut pos, 4, "max_token_length")?.try_into().unwrap()) as usize;
+        let raw_max_len =
+            i32::from_le_bytes(take(&mut pos, 4, "max_token_length")?.try_into().unwrap());
+        if raw_max_len < 0 {
+            return Err(TokenizerError::InvalidFormat(format!(
+                "max_token_length must be non-negative, got {raw_max_len}"
+            )));
+        }
+        let max_token_length = raw_max_len as usize;
+
+        // Bound pre-allocation by the file size: each record requires at least
+        // 8 bytes (4-byte f32 score + 4-byte i32 length).
+        let min_bytes = vocab_size.checked_mul(8).ok_or(TokenizerError::Overflow {
+            what: "vocab table",
+        })?;
+        let remaining = data.len() - pos;
+        if remaining < min_bytes {
+            return Err(TokenizerError::Truncated {
+                what: "vocab table",
+                need: min_bytes,
+                have: remaining,
+            });
+        }
 
         let mut vocab = Vec::with_capacity(vocab_size);
         let mut scores = Vec::with_capacity(vocab_size);
@@ -171,14 +206,11 @@ impl Tokenizer {
                 })?);
             let len = i32::from_le_bytes(take(&mut pos, 4, "vocab length")?.try_into().unwrap());
             // A negative length is a malformed record, not a request to read
-            // backwards. Cast through i64 so the check is exact on every
-            // platform rather than relying on a wrapping cast.
+            // backwards.
             if len < 0 {
-                return Err(TokenizerError::Truncated {
-                    what: "vocab length",
-                    need: 0,
-                    have: usize::MAX,
-                });
+                return Err(TokenizerError::InvalidFormat(format!(
+                    "negative token length {len} at id {id}"
+                )));
             }
             let len = len as usize;
             // `max_token_length` comes from the same untrusted file, so it is
@@ -191,7 +223,6 @@ impl Tokenizer {
             let bytes = take(&mut pos, len, "vocab bytes")?.to_vec();
             vocab.push(bytes);
             scores.push(score);
-            let _ = id;
         }
 
         if pos != data.len() {
@@ -312,9 +343,12 @@ impl Tokenizer {
         }
 
         // --- step 4: BPE merges -------------------------------------------
-        // Reused across iterations so the loop allocates nothing. Sized from
-        // max_token_length because a candidate is at most two tokens long.
-        let mut candidate: Vec<u8> = Vec::with_capacity(2 * self.max_token_length);
+        // Reused across iterations so the loop avoids reallocating for normal
+        // tokens. The capacity hint is capped so an untrusted `max_token_length`
+        // header cannot trigger a multi-gigabyte allocation; the vector grows
+        // on demand if a merge ever exceeds the hint.
+        let cap = self.max_token_length.min(1024).saturating_mul(2);
+        let mut candidate: Vec<u8> = Vec::with_capacity(cap);
 
         loop {
             // Sentinel for "no merge found". The reference initialises
@@ -431,23 +465,36 @@ impl Tokenizer {
         String::from_utf8_lossy(&out).into_owned()
     }
 
+    /// Decode one token into raw bytes given the token before it.
+    ///
+    /// Preserves raw bytes before any UTF-8 conversion so callers such as the
+    /// CLI's `safe_print` can inspect single non-ASCII byte-fallback tokens
+    /// (`<0x80>`..`<0xFF>`) and emit multi-byte pieces verbatim, matching
+    /// `llama2.c`'s `safe_printf`.
+    pub fn decode_one_bytes(&self, prev_token: Option<u32>, token: u32) -> Vec<u8> {
+        if token == BOS_ID || token == EOS_ID {
+            return Vec::new();
+        }
+        let piece = match self.vocab.get(token as usize) {
+            Some(p) => p,
+            None => return Vec::new(),
+        };
+        if prev_token == Some(BOS_ID) && piece.first() == Some(&b' ') {
+            return piece[1..].to_vec();
+        }
+        if let Some(byte) = parse_byte_token(piece) {
+            return vec![byte];
+        }
+        piece.to_vec()
+    }
+
     /// Decode one token given the token before it.
     ///
     /// Generation needs this form, because the dummy-prefix rule depends on
     /// the previous token and streaming decoding does not have the whole
     /// sequence in hand.
     pub fn decode_one(&self, prev_token: Option<u32>, token: u32) -> String {
-        if token == BOS_ID || token == EOS_ID {
-            return String::new();
-        }
-        if prev_token == Some(BOS_ID) {
-            if let Some(piece) = self.vocab.get(token as usize) {
-                if piece.first() == Some(&b' ') {
-                    return String::from_utf8_lossy(&piece[1..]).into_owned();
-                }
-            }
-        }
-        self.decode_inner(&[token], true)
+        String::from_utf8_lossy(&self.decode_one_bytes(prev_token, token)).into_owned()
     }
 }
 

@@ -73,6 +73,8 @@ pub enum RunError {
     PositionOutOfRange { pos: usize, seq_len: usize },
     TooManyTokens { requested: usize, seq_len: usize },
     EmptyPrompt,
+    StateMismatch { detail: String },
+    NonFiniteLogit { pos: usize },
 }
 
 impl fmt::Display for RunError {
@@ -91,6 +93,10 @@ impl fmt::Display for RunError {
                 "{requested} tokens will not fit in a context of {seq_len}"
             ),
             RunError::EmptyPrompt => write!(f, "the prompt contains no tokens"),
+            RunError::StateMismatch { detail } => write!(f, "state mismatch: {detail}"),
+            RunError::NonFiniteLogit { pos } => {
+                write!(f, "non-finite (NaN) logit produced at position {pos}")
+            }
         }
     }
 }
@@ -259,6 +265,11 @@ fn checked_tensor_len(what: &'static str, dims: &[usize]) -> Result<usize, LoadE
 /// buffer is both a faithful representation of the file and one fewer
 /// indirection in the hot loop; [`Weights::layer`] hands out the per-layer
 /// slice.
+///
+/// Fields are public for test and tool inspection. Callers that construct or
+/// mutate `Weights` fields directly rather than using [`Weights::load`] or
+/// [`Weights::from_bytes`] are responsible for preserving buffer-length
+/// invariants relative to `config`.
 #[derive(Debug, Clone)]
 pub struct Weights {
     pub config: Config,
@@ -555,10 +566,25 @@ impl Weights {
 /// The cache dominates, and it dominates because it is the whole point: it is
 /// what makes decoding O(n) per token rather than O(n^2). See
 /// [`State::forward`].
+/// Allocate a zero-initialised `Vec<f32>` fallibly so both `isize::MAX` byte
+/// capacity overflows and host out-of-memory errors become `LoadError::Overflow`
+/// instead of aborting the process.
+fn try_zeroed_f32_vec(what: &'static str, len: usize) -> Result<Vec<f32>, LoadError> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len)
+        .map_err(|_| LoadError::Overflow { what })?;
+    v.resize(len, 0.0);
+    Ok(v)
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
+    /// Model configuration this state was allocated for. Checked at the entry
+    /// of [`State::forward`] so mismatched `(State, Weights)` pairs return an
+    /// error instead of panicking inside a layer.
+    config: Config,
     /// The residual stream. This is the vector that flows through the layers.
-    pub x: Vec<f32>,
+    x: Vec<f32>,
     /// Generic scratch for a normalised or projected activation.
     xb: Vec<f32>,
     /// SwiGLU gate output (`w1 @ xb`).
@@ -575,7 +601,7 @@ pub struct State {
     /// Attention output for this step, `n_heads * head_size`, before `wo`.
     att: Vec<f32>,
     /// Final logits, `vocab_size`.
-    pub logits: Vec<f32>,
+    logits: Vec<f32>,
     /// Attention score scratch, `seq_len`, reused across every head.
     scores: Vec<f32>,
 
@@ -590,13 +616,12 @@ impl State {
     /// Allocate every buffer for a given model.
     ///
     /// The cache allocation is a product of three header-derived numbers, so it
-    /// uses the same checked arithmetic as the loader. A header that validated
-    /// structurally can still describe a cache larger than memory (a 32-layer
-    /// 2048-context 4096-dim model is 4 GiB of f32 per cache), and that has to
-    /// be a clean `Err` at construction rather than an abort in the middle of
-    /// the first forward pass.
+    /// uses the same checked arithmetic as the loader, followed by fallible
+    /// allocation via `Vec::try_reserve_exact`. A structurally valid header can
+    /// still describe a cache larger than address space or available RAM, and
+    /// that has to be an `Err` at construction rather than an abort.
     pub fn new(config: &Config) -> Result<Self, LoadError> {
-        let dims = config.attention_dims()?;
+        let dims = config.validate()?;
         let d = config.dim;
         let q_dim = dims.q_dim();
         let kv_dim = dims.kv_dim();
@@ -607,19 +632,30 @@ impl State {
             .ok_or(LoadError::Overflow { what: "kv cache" })?;
 
         Ok(State {
-            x: vec![0.0; d],
-            xb: vec![0.0; d],
-            hb: vec![0.0; config.hidden_dim],
-            hb2: vec![0.0; config.hidden_dim],
-            q: vec![0.0; q_dim],
-            k: vec![0.0; kv_dim],
-            v: vec![0.0; kv_dim],
-            att: vec![0.0; q_dim],
-            logits: vec![0.0; config.vocab_size],
-            scores: vec![0.0; config.seq_len],
-            key_cache: vec![0.0; cache],
-            value_cache: vec![0.0; cache],
+            config: *config,
+            x: try_zeroed_f32_vec("x", d)?,
+            xb: try_zeroed_f32_vec("xb", d)?,
+            hb: try_zeroed_f32_vec("hb", config.hidden_dim)?,
+            hb2: try_zeroed_f32_vec("hb2", config.hidden_dim)?,
+            q: try_zeroed_f32_vec("q", q_dim)?,
+            k: try_zeroed_f32_vec("k", kv_dim)?,
+            v: try_zeroed_f32_vec("v", kv_dim)?,
+            att: try_zeroed_f32_vec("att", q_dim)?,
+            logits: try_zeroed_f32_vec("logits", config.vocab_size)?,
+            scores: try_zeroed_f32_vec("scores", config.seq_len)?,
+            key_cache: try_zeroed_f32_vec("kv cache", cache)?,
+            value_cache: try_zeroed_f32_vec("kv cache", cache)?,
         })
+    }
+
+    /// Current residual-stream activation (`dim` floats).
+    pub fn x(&self) -> &[f32] {
+        &self.x
+    }
+
+    /// Most recently computed vocabulary logits (`vocab_size` floats).
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
     }
 
     /// Forget the KV cache, so the same `State` can decode a new sequence.
@@ -662,6 +698,14 @@ impl State {
     /// ordering is the caller's responsibility and should be visible.
     pub fn forward(&mut self, w: &Weights, token: u32, pos: usize) -> Result<&[f32], RunError> {
         let cfg = &w.config;
+        if self.config != *cfg {
+            return Err(RunError::StateMismatch {
+                detail: format!(
+                    "state config {:?} does not match weights config {:?}",
+                    self.config, cfg
+                ),
+            });
+        }
         if token as usize >= cfg.vocab_size {
             return Err(RunError::TokenOutOfRange {
                 token,
@@ -772,28 +816,33 @@ impl State {
     }
 }
 
-/// Index and value of the largest logit.
+/// Index and value of the largest logit, or `None` if `logits` is empty.
 ///
-/// `best_val.is_nan()` in the condition is what makes this total on `NaN`
-/// input. A plain `v > best_val` would never be true for a `NaN`, so a `NaN`
-/// would simply be skipped and the argmax would be whatever the largest *finite*
-/// logit was. Checking the incumbent instead means the first `NaN` encountered
-/// wins and every subsequent element replaces it, which is arbitrary but
-/// deterministic. Greedy decoding has to return *something* even for a broken
-/// model, and "something deterministic" is worth more than "something finite".
+/// Returning `Option` enforces non-empty results in the type system so `argmax`
+/// never panics and never returns an out-of-bounds index.
 ///
-/// It also never returns out of bounds: `best_idx` is only ever set together
-/// with a value read from the slice.
-pub fn argmax(logits: &[f32]) -> (usize, f32) {
+/// If any element is `NaN`, the **first** `NaN` encountered is returned
+/// immediately rather than skipped: returning a finite token when part of the
+/// logit vector has already diverged would hide model corruption, whereas
+/// returning the first `NaN` is deterministic and surfaces the fault. Ties
+/// among finite values resolve to the lowest index.
+pub fn argmax(logits: &[f32]) -> Option<(usize, f32)> {
+    let (&first, rest) = logits.split_first()?;
+    if first.is_nan() {
+        return Some((0, first));
+    }
     let mut best_idx = 0usize;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > best_val || best_val.is_nan() {
-            best_idx = i;
+    let mut best_val = first;
+    for (offset, &v) in rest.iter().enumerate() {
+        if v.is_nan() {
+            return Some((offset + 1, v));
+        }
+        if v > best_val {
+            best_idx = offset + 1;
             best_val = v;
         }
     }
-    (best_idx, best_val)
+    Some((best_idx, best_val))
 }
 
 /// Greedy-decode up to `n` tokens after `prompt`.
@@ -812,7 +861,7 @@ pub fn argmax(logits: &[f32]) -> (usize, f32) {
 /// *last* prompt token are the ones that predict the first generated token, so
 /// that pass is not wasted. Each subsequent generated token needs exactly one
 /// more pass, and the loop below stops before issuing a pass whose output it
-/// would not use. Total passes: `prompt.len() + n - 1`.
+/// would not use. Total passes: `prompt.len() + n.saturating_sub(1)`.
 ///
 /// Returns the generated tokens, excluding the prompt.
 ///
@@ -829,6 +878,16 @@ pub fn argmax(logits: &[f32]) -> (usize, f32) {
 /// reference: with a BOS-terminated checkpoint, stopping on EOS means never
 /// stopping, and the generated text diverges from `run.c` at exactly the
 /// position where the first document ended.
+fn pick_next_token(logits: &[f32], pos: usize) -> Result<u32, RunError> {
+    let (idx, val) = argmax(logits).ok_or_else(|| RunError::StateMismatch {
+        detail: "forward returned empty logits".into(),
+    })?;
+    if val.is_nan() {
+        return Err(RunError::NonFiniteLogit { pos });
+    }
+    Ok(idx as u32)
+}
+
 pub fn generate(
     w: &Weights,
     state: &mut State,
@@ -841,9 +900,13 @@ pub fn generate(
         // hide a caller bug behind a plausible-looking result.
         return Err(RunError::EmptyPrompt);
     }
-    if prompt.len() + n > w.config.seq_len {
+    if prompt
+        .len()
+        .checked_add(n)
+        .map_or(true, |total| total > w.config.seq_len)
+    {
         return Err(RunError::TooManyTokens {
-            requested: prompt.len() + n,
+            requested: prompt.len().saturating_add(n),
             seq_len: w.config.seq_len,
         });
     }
@@ -855,7 +918,7 @@ pub fn generate(
     for (pos, &t) in prompt.iter().enumerate() {
         let logits = state.forward(w, t, pos)?;
         if pos + 1 == prompt.len() {
-            next = argmax(logits).0 as u32;
+            next = pick_next_token(logits, pos)?;
         }
     }
 
@@ -874,8 +937,8 @@ pub fn generate(
             break;
         }
         let logits = state.forward(w, next, pos)?;
+        next = pick_next_token(logits, pos)?;
         pos += 1;
-        next = argmax(logits).0 as u32;
     }
 
     Ok(generated)
