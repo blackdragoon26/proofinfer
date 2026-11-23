@@ -212,7 +212,7 @@ fn trailing_bytes_are_rejected() {
     // A whole phantom tensor's worth of bytes is also rejected.
     let shape = Shape::default();
     let mut bytes = build_checkpoint(shape);
-    bytes.extend(std::iter::repeat_n(0u8, shape.dim as usize * 4));
+    bytes.extend(std::iter::repeat(0u8).take(shape.dim as usize * 4));
     let err = Weights::from_bytes(&bytes).expect_err("trailing tensor must not load");
     assert_eq!(err, LoadError::TrailingBytes(shape.dim as usize * 4));
 }
@@ -244,7 +244,7 @@ fn zero_fields_are_rejected() {
             seq: fields[6],
         };
         let mut bytes = shape.header_bytes();
-        bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+        bytes.extend(std::iter::repeat(0u8).take(1 << 20));
         let err = Weights::from_bytes(&bytes)
             .err()
             .unwrap_or_else(|| panic!("field {idx} = 0 was accepted"));
@@ -284,7 +284,7 @@ fn negative_fields_are_rejected() {
         let mut bytes = shape.header_bytes();
         // A generous body, so the header check is what rejects it and not a
         // short file.
-        bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+        bytes.extend(std::iter::repeat(0u8).take(1 << 20));
         let err = Weights::from_bytes(&bytes)
             .err()
             .unwrap_or_else(|| panic!("field {idx} = -1 was accepted"));
@@ -303,7 +303,7 @@ fn bad_divisibility_is_rejected() {
         ..Default::default()
     };
     let mut bytes = shape.header_bytes();
-    bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+    bytes.extend(std::iter::repeat(0u8).take(1 << 20));
     let err = Weights::from_bytes(&bytes).expect_err("dim=65, heads=4 must be rejected");
     match err {
         LoadError::InvalidHeader(m) => assert!(m.contains("divisible by n_heads"), "{m}"),
@@ -317,7 +317,7 @@ fn bad_divisibility_is_rejected() {
         ..Default::default()
     };
     let mut bytes = shape.header_bytes();
-    bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+    bytes.extend(std::iter::repeat(0u8).take(1 << 20));
     let err = Weights::from_bytes(&bytes).expect_err("heads=4, kv=3 must be rejected");
     match err {
         LoadError::InvalidHeader(m) => assert!(m.contains("divisible by n_kv_heads"), "{m}"),
@@ -332,7 +332,7 @@ fn bad_divisibility_is_rejected() {
         ..Default::default()
     };
     let mut bytes = shape.header_bytes();
-    bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+    bytes.extend(std::iter::repeat(0u8).take(1 << 20));
     let err = Weights::from_bytes(&bytes).expect_err("odd head_size must be rejected");
     match err {
         LoadError::InvalidHeader(m) => assert!(m.contains("even"), "{m}"),
@@ -352,7 +352,7 @@ fn i32_extremes_are_rejected_without_panicking() {
             ..Default::default()
         };
         let mut bytes = shape.header_bytes();
-        bytes.extend(std::iter::repeat_n(0u8, 1 << 20));
+        bytes.extend(std::iter::repeat(0u8).take(1 << 20));
         // The only requirement is totality: Ok or Err, never a panic.
         let _ = Weights::from_bytes(&bytes);
     }
@@ -371,7 +371,7 @@ fn i32_extremes_are_rejected_without_panicking() {
             seq: fields[6],
         };
         let mut bytes = shape.header_bytes();
-        bytes.extend(std::iter::repeat_n(0u8, 1 << 16));
+        bytes.extend(std::iter::repeat(0u8).take(1 << 16));
         let _ = Weights::from_bytes(&bytes);
     }
 }
@@ -400,7 +400,7 @@ fn a_header_whose_size_products_overflow_is_rejected() {
         seq: 1,
     };
     let mut bytes = shape.header_bytes();
-    bytes.extend(std::iter::repeat_n(0u8, 1 << 16));
+    bytes.extend(std::iter::repeat(0u8).take(1 << 16));
     let err = Weights::from_bytes(&bytes).expect_err("overflowing header must be rejected");
     assert!(
         matches!(err, LoadError::Overflow { .. }),
@@ -426,7 +426,7 @@ fn a_large_but_non_overflowing_header_is_rejected_as_truncated_not_allocated() {
     };
     // head_size = 128, even; 32 % 32 == 0. Structurally legal.
     let mut bytes = shape.header_bytes();
-    bytes.extend(std::iter::repeat_n(0u8, 1 << 16));
+    bytes.extend(std::iter::repeat(0u8).take(1 << 16));
     let err = Weights::from_bytes(&bytes).expect_err("huge header on a tiny file must fail");
     assert!(
         matches!(err, LoadError::Truncated { .. }),

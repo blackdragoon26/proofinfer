@@ -42,10 +42,10 @@ verus! {
 // 1. The shapes, as a ghost struct
 // ===========================================================================
 //
-// Mirrors `src/model.rs::Config` plus the quantities `src/ops.rs` derives:
-// `kv_dim = head_size * n_kv_heads` (ops.rs:350-352), `kv_mul = n_heads /
-// n_kv_heads` (ops.rs:356-358) and the per-layer cache stride
-// `seq_len * kv_dim` (model.rs:682).
+// Mirrors `Config` in `src/model.rs` plus the quantities `src/ops.rs` derives:
+// `kv_dim = head_size * n_kv_heads` (`ops.rs::AttentionDims::kv_dim`),
+// `kv_mul = n_heads / n_kv_heads` (`ops.rs::AttentionDims::kv_mul`) and the
+// per-layer cache stride `seq_len * kv_dim` (`model.rs::State::forward`).
 //
 // Fields are `int` rather than `nat` because this Verus version's `nat` is a
 // distinct type from the `int` that vstd's arithmetic lemmas are stated over.
@@ -62,9 +62,9 @@ pub struct Shapes {
 
 impl Shapes {
     /// The structural rules, transcribed from the checks in
-    /// `AttentionDims::try_new` (ops.rs:315-345) and `Config::validate`
-    /// (model.rs:123-144). `lemma_shapes_from_config` below shows that
-    /// anything passing those checks really does satisfy this.
+    /// `ops.rs::AttentionDims::try_new` and `model.rs::Config::validate`.
+    /// `lemma_shapes_from_config` below shows that anything passing those
+    /// checks really does satisfy this.
     pub open spec fn valid(&self) -> bool {
         &&& self.n_layers > 0
         &&& self.n_heads > 0
@@ -74,28 +74,28 @@ impl Shapes {
         &&& self.n_heads % self.n_kv_heads == 0
     }
 
-    /// ops.rs:350-352. Width of one key or value row.
+    /// `ops.rs::AttentionDims::kv_dim`. Width of one key or value row.
     pub open spec fn kv_dim(&self) -> int {
         self.head_size * self.n_kv_heads
     }
 
-    /// ops.rs:356-358. How many query heads share one KV head.
+    /// `ops.rs::AttentionDims::kv_mul`. How many query heads share one KV head.
     pub open spec fn kv_mul(&self) -> int {
         self.n_heads / self.n_kv_heads
     }
 
-    /// ops.rs:362-364.
+    /// `ops.rs::AttentionDims::q_dim`.
     pub open spec fn q_dim(&self) -> int {
         self.head_size * self.n_heads
     }
 
-    /// model.rs:682. Floats per layer of the cache.
+    /// `model.rs::State::forward`. Floats per layer of the cache.
     pub open spec fn kv_layer_stride(&self) -> int {
         self.seq_len * self.kv_dim()
     }
 
-    /// model.rs:603-607 together with the allocation at model.rs:620-621.
-    /// This is the length of `key_cache` and of `value_cache`.
+    /// `model.rs::State::new`. This is the length of `key_cache` and of
+    /// `value_cache`.
     pub open spec fn cache_len(&self) -> int {
         self.n_layers * self.kv_layer_stride()
     }
@@ -108,14 +108,14 @@ impl Shapes {
 /// A `Shapes` value produced by the loader really does satisfy `valid()`.
 ///
 /// This is the honest link between the lemmas below and the code: the shape
-/// invariants are *derived* from exactly the conditions `Config::validate`
-/// (model.rs:123-144) and `AttentionDims::try_new` (ops.rs:315-345) check,
+/// invariants are *derived* from exactly the conditions
+/// `model.rs::Config::validate` and `ops.rs::AttentionDims::try_new` check,
 /// rather than assumed.
 ///
 /// The one non-obvious step is `head_size > 0`. The loader never checks it,
-/// because it computes `head_size = dim / n_heads` (ops.rs:334) only after
-/// rejecting `dim == 0` (ops.rs:321-323) and `dim % n_heads != 0`
-/// (ops.rs:324-326); a divisor of a positive number is positive.
+/// because `ops.rs::AttentionDims::try_new` computes `head_size = dim / n_heads`
+/// only after rejecting `dim == 0` and `dim % n_heads != 0`; a divisor of a
+/// positive number is positive.
 pub proof fn lemma_shapes_from_config(
     n_layers: int,
     dim: int,
@@ -169,7 +169,7 @@ pub proof fn lemma_kv_mul_tiles_heads(s: &Shapes)
     assert(s.n_heads % s.n_kv_heads == 0);
 }
 
-/// The GQA mapping `kv = h / kv_mul` (ops.rs:428) lands inside `0..n_kv_heads`.
+/// The GQA mapping `kv = h / kv_mul` (`ops.rs::attention`) lands inside `0..n_kv_heads`.
 ///
 /// Worth stating even though it is not what the question is about, because it
 /// also shows the limit of this style of proof: mutant #3 replaces
@@ -213,7 +213,7 @@ pub proof fn lemma_gqa_head_in_range(s: &Shapes, h: int)
 // 4. The attention read  (src/ops.rs)
 // ===========================================================================
 //
-// src/ops.rs:432-436 and 443-445:
+// `ops.rs::attention`:
 //
 //   for t in 0..limit {
 //       let k_row = &key_cache[t * kv_dim + kv * head_size
@@ -225,8 +225,8 @@ pub proof fn lemma_gqa_head_in_range(s: &Shapes, h: int)
 
 /// The `pos + 1` live rows fit in one layer because `pos < seq_len`.
 ///
-/// This is the step that turns the caller's guard at model.rs:671-676 into
-/// attention's precondition at ops.rs:422-425
+/// This is the step that turns the caller's guard in `model.rs::State::forward`
+/// into attention's precondition in `ops.rs::attention`
 /// (`limit * kv_dim <= key_cache.len()`).
 pub proof fn lemma_limit_rows_fit_in_layer(s: &Shapes, pos: int)
     requires
@@ -308,7 +308,7 @@ pub proof fn lemma_layer_slice_in_cache(s: &Shapes, l: int)
     assert(s.cache_len() == s.n_layers * s.kv_layer_stride());
 }
 
-/// The per-layer cache write is in bounds.  src/model.rs:711-713:
+/// The per-layer cache write is in bounds (`model.rs::State::forward`):
 ///
 /// ```text
 /// let base = l * kv_layer_stride + pos * kv_dim;
@@ -369,8 +369,8 @@ pub proof fn lemma_attention_row_in_cache(s: &Shapes, l: int, pos: int, t: int, 
         <= l * s.kv_layer_stride() + s.kv_layer_stride());
 }
 
-/// The score scratch window `&mut scores[..limit]` (ops.rs:430) against
-/// `scores`, allocated with `seq_len` floats at model.rs:619.
+/// The score scratch window `&mut scores[..limit]` (`ops.rs::attention`)
+/// against `scores`, allocated with `seq_len` floats in `model.rs::State::new`.
 pub proof fn lemma_scores_window_in_scratch(s: &Shapes, pos: int)
     requires
         s.valid(),
@@ -381,8 +381,9 @@ pub proof fn lemma_scores_window_in_scratch(s: &Shapes, pos: int)
     assert(pos + 1 <= s.seq_len);
 }
 
-/// The query head slice `&q[h * head_size..(h + 1) * head_size]` (ops.rs:429)
-/// against `q`, allocated with `n_heads * head_size` floats (model.rs:614).
+/// The query head slice `&q[h * head_size..(h + 1) * head_size]`
+/// (`ops.rs::attention`) against `q`, allocated with `n_heads * head_size`
+/// floats (`model.rs::State::new`).
 pub proof fn lemma_query_head_in_q(s: &Shapes, h: int)
     requires
         s.valid(),
@@ -435,15 +436,15 @@ pub proof fn lemma_index_fits_in_usize(index: int, buf_len: int)
 // including its implicit no-overflow check on the index arithmetic.
 //
 // The `requires` of each function are exactly the facts the calling context
-// supplies: the overflow bounds come from the loader's `checked_mul`
-// (model.rs:603-607), and the buffer-length bounds are the `debug_assert!`s
-// at ops.rs:423-425, which `lemma_limit_rows_fit_in_layer` shows are implied
-// by the `pos < seq_len` guard at model.rs:671-676.
+// supplies: the overflow bounds come from `model.rs::State::new`'s
+// `checked_mul`, and the buffer-length bounds are the `debug_assert!`s in
+// `ops.rs::attention`, which `lemma_limit_rows_fit_in_layer` shows are implied
+// by the `pos < seq_len` guard in `model.rs::State::forward`.
 //
 // These functions are proof artifacts, never called. Their value is that a
 // future edit to one of these index expressions makes Verus say so.
 
-/// src/ops.rs:397-454, the cache reads.
+/// `ops.rs::attention`, the cache reads.
 ///
 /// `out` and `scores` are modelled as shared references rather than the `&mut`
 /// that the real signature uses. Writing to them cannot affect whether an index
@@ -465,16 +466,16 @@ pub fn exec_attention_read(
     pos: usize,
 )
     requires
-        // AttentionDims::try_new, ops.rs:315-345
+        // `ops.rs::AttentionDims::try_new`
         n_heads > 0,
         n_kv_heads > 0,
         n_heads % n_kv_heads == 0,
         head_size > 0,
-        // the loader's checked_mul, model.rs:603-607
+        // `model.rs::State::new`'s `checked_mul`
         head_size * n_kv_heads <= usize::MAX,
         n_heads * head_size <= usize::MAX,
         pos < usize::MAX,
-        // the debug_assert!s, ops.rs:412-425
+        // the `debug_assert!`s in `ops.rs::attention`
         out.len() == n_heads * head_size,
         q.len() == n_heads * head_size,
         scores.len() >= pos + 1,
@@ -552,7 +553,7 @@ pub fn exec_attention_read(
         let kv = h / kv_mul;
         assert(kv < n_kv_heads);
 
-        // ops.rs:429, 430 and 440, the query head, the score window and the
+        // `ops.rs::attention`: the query head, the score window and the
         // output head
         proof {
             assert(n_heads as int * head_size as int == q.len() as int);
@@ -658,8 +659,8 @@ pub fn exec_attention_read(
     }
 }
 
-/// src/model.rs:711-724, the per-layer cache write and the layer slice handed
-/// to `ops::attention`.
+/// `model.rs::State::forward`, the per-layer cache write and the layer slice
+/// handed to `ops::attention`.
 #[verifier::exec_allows_no_decreases_clause]
 pub fn exec_forward_cache_write_and_layer_slice(
     key_cache: &Vec<f32>,
@@ -671,17 +672,17 @@ pub fn exec_forward_cache_write_and_layer_slice(
     pos: usize,
 )
     requires
-        // Config::validate, model.rs:123-144
+        // `model.rs::Config::validate`
         n_layers > 0,
         head_size > 0,
         n_kv_heads > 0,
-        // State::forward's guard, model.rs:671-676
+        // `model.rs::State::forward`'s guard
         pos < seq_len,
-        // State::new's checked_mul, model.rs:603-607
+        // `model.rs::State::new`'s `checked_mul`
         head_size * n_kv_heads <= usize::MAX,
         (n_layers * seq_len) * (head_size * n_kv_heads) <= usize::MAX,
         seq_len * (head_size * n_kv_heads) <= usize::MAX,
-        // the resulting allocation, model.rs:620-621
+        // the resulting allocation in `model.rs::State::new`
         key_cache.len() == n_layers * (seq_len * (head_size * n_kv_heads)),
         value_cache.len() == n_layers * (seq_len * (head_size * n_kv_heads)),
 {
@@ -712,7 +713,7 @@ pub fn exec_forward_cache_write_and_layer_slice(
             value_cache.len() == n_layers * kv_layer_stride,
         decreases n_layers - l,
     {
-        // model.rs:711-713
+        // `model.rs::State::forward` cache write
         proof {
             assert((pos as int) < (seq_len as int));
             assert((pos as int) + 1 <= seq_len as int);
@@ -743,7 +744,7 @@ pub fn exec_forward_cache_write_and_layer_slice(
         let _k_slot = &key_cache[base..base + kv_dim];
         let _v_slot = &value_cache[base..base + kv_dim];
 
-        // model.rs:718-719 and 723-724
+        // `model.rs::State::forward` layer slice
         let layer_start = l * kv_layer_stride;
         let layer_end = layer_start + kv_layer_stride;
         let _layer = &key_cache[layer_start..layer_end];

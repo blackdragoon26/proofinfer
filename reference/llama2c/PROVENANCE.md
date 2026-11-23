@@ -25,17 +25,17 @@ hashes still match, or resolve them against upstream history.
 
 ## Vendored files
 
-`filename`, `bytes`, and the first 16 hex characters of the sha256:
+`filename`, `bytes`, and the full 64-character sha256 digest:
 
-| filename | bytes | sha256 (first 16) |
+| filename | bytes | sha256 |
 |---|---:|---|
-| `model.py` | 15289 | `54f35dbd347100c0` |
-| `export.py` | 24513 | `aba8d36ee881478b` |
-| `tokenizer.py` | 2866 | `585d1c34be6f387d` |
-| `tokenizer.bin` | 433869 | `50a52ef822ee9e83` |
-| `LICENSE` | 1063 | `e87b912002f04cdfa` |
-| `test.c` | 3574 | `ea6d3b4368147d5a` |
-| `run.c` | 38545 | `9c4f2d5c6ae01b71` |
+| `model.py` | 15289 | `54f35dbd347100c0066da93dfdf9f19c2ec1e8758bfffcedbdfdb09d5c343e1f` |
+| `export.py` | 24513 | `aba8d36ee881478bf59e13f63224e37a00b51a18cacbc38d0def52cc3c0cb475` |
+| `tokenizer.py` | 2866 | `585d1c34be6f387d3143297c7fbbce49ad362dc9cecd9f68037bbed8126bcf33` |
+| `tokenizer.bin` | 433869 | `50a52ef822ee9e83de5ce9d0be0a025a773d019437f58b5ff9dcafb063ece361` |
+| `LICENSE` | 1063 | `e87b912002f04cdfa837eaf7f70548ab79b9cb62a285495edf575f3da875aec4` |
+| `test.c` | 3574 | `ea6d3b4368147d5aea36024e2294f4b69709fa44bff2c7b70aed86682de4f76a` |
+| `run.c` | 38545 | `9c4f2d5c6ae01b71726d1cc37530d71e60bff0ec7cc012565f16a43c1ca658bd` |
 
 `test.c` is vendored for the token vectors it pins; `run.c` is the C reference
 implementation used for the byte-identical greedy comparison benchmark.
@@ -50,11 +50,13 @@ straight from the extracted tarball and never opened for writing afterward.
 To verify:
 
 ```sh
+python3 reference/check_provenance.py
+# or directly:
 cd reference/llama2c
-shasum -a 256 model.py export.py tokenizer.py tokenizer.bin LICENSE test.c run.c
+sha256sum model.py export.py tokenizer.py tokenizer.bin LICENSE test.c run.c
 ```
 
-The full digests must equal the truncated values above. To verify against a
+The full digests must match the table above. To verify against a
 freshly downloaded upstream tarball, extract it and `diff -r` this directory
 against the upstream copies of the same seven files; the result must be empty.
 
