@@ -26,6 +26,9 @@
 
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -278,7 +281,7 @@ jobs:
         run: |
           set -euo pipefail
           cc -O3 -o run_O3 reference/llama2c/run.c -lm
-          python reference/bench.py --model stories15M.bin --runs 1 --run-c ./run_O3
+          python reference/bench.py --model stories15M.bin --runs 1 --run-c "$PWD/run_O3"
 
   # ---------------------------------------------------------------------------
   proof:

@@ -131,16 +131,17 @@ claiming otherwise.**
    is a proof *about a transcription*.
 
    `verus/check_citations.py` closes the syntactic drift mode on *both* sides:
-   it strips `//` comments and string literals, resolves each symbol cited in
-   this file and in `kv_cache_bounds.rs`, asserts every required normalized
-   expression (including full lower and upper slice bounds and `checked_mul`
-   chains) appears in `src/`, asserts the paired `exec_*` body in
-   `verus/kv_cache_bounds.rs` contains the matching normalized expressions, and
-   runs `--self-test` in CI to prove mutations on either side fail. What that
-   check does *not* do is verify semantic equivalence across un-cited code: an
-   edit that preserves a cited expression's text while altering how variables
-   are initialized elsewhere, or a gap in which expressions were transcribed at
-   all, would still pass.
+   it tokenizes Rust code (skipping `//` and nested `/* ... */` comments,
+   treating string literals as atomic tokens so string text cannot satisfy a
+   code check, and matching on full token boundaries), resolves each symbol
+   cited in this file and in `kv_cache_bounds.rs`, asserts every required token
+   sequence (including full lower and upper slice bounds and `checked_mul`
+   chains) appears in `src/` and in the paired `exec_*` body in
+   `verus/kv_cache_bounds.rs`, and runs `--self-test` in CI to prove mutations
+   on either side fail. What that check does *not* do is verify semantic
+   equivalence across un-cited code: an edit that preserves a cited expression's
+   tokens while altering how variables are initialized elsewhere, or a gap in
+   which expressions were transcribed at all, would still pass.
 3. **The loader's `checked_mul` is assumed, not proved.** The overflow
    preconditions in the `exec fn`s (`head_size * n_kv_heads <= usize::MAX`,
    `(n_layers * seq_len) * (head_size * n_kv_heads) <= usize::MAX`,

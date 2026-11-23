@@ -98,7 +98,7 @@ Two guards keep that number honest:
 
 #### Rust tests, and proof they can fail
 
-83 tests, passing in both release and debug (debug matters: it enables integer
+84 tests, passing in both release and debug (debug matters: it enables integer
 overflow checks, which is where a wrapping size computation in the loader would
 show up), and tested on the documented MSRV (`1.70.0`) as well as stable.
 
@@ -108,7 +108,7 @@ show up), and tested on the documented MSRV (`1.70.0`) as well as stable.
 | `src/main.rs` | 2 | raw-byte `safe_print` parity with `run.c` and clean `BrokenPipe` handling |
 | `tests/loader.rs` | 18 | totality over hostile input, 2000 pseudo-random buffers, overflow, tensor ordering |
 | `tests/tokenizer.rs` | 18 | exact conformance to Meta's published token ids, hostile headers, raw-byte decode, byte fallback, round trips |
-| `tests/engine.rs` | 21 | causality, determinism, BOS termination, `State::reset` equivalence, config-mismatch rejection, `State::new` overflow/zero-field rejection, `argmax` totality on empty and NaN |
+| `tests/engine.rs` | 22 | causality, determinism, BOS termination, `State::reset` equivalence, config-mismatch rejection, `State::new` overflow/zero-field rejection, `argmax` totality on empty/NaN, `generate` NaN rejection |
 
 But a passing suite only says the tests agree with the code. It does not say
 they can *notice* disagreement, so `reference/mutation_check_tests.py` injects 21
@@ -153,11 +153,11 @@ red. This is the inventory:
 | check | how it was shown to fail |
 |---|---|
 | `diff_test.py` (6 configs) | 10 injected bugs, `mutation_check.py`, 10/10 (requires a named `FAIL` config; crashes and harness errors are rejected) |
-| `cargo test` (83 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 (requires `--no-run` compile success plus at least one `test ... FAILED`; syntax errors fail as `COMPILE_ERROR`) |
+| `cargo test` (84 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 (requires `--no-run` compile success plus at least one `test ... FAILED`; syntax errors fail as `COMPILE_ERROR`) |
 | byte-identical greedy output | a RoPE-less mutant binary: `bench.py` reports `DIFFERENT` and exits 1 |
 | zero-dependency & lockfile v3 assertion | a `Cargo.lock` with a second package, with zero packages, naming another package, or upgraded past `version = 3` — all rejected |
 | `reference/check_provenance.py` | 1-byte flip in a vendored file and an unlisted extra file in a scratch copy — both rejected |
-| `verus/check_citations.py` | built-in `--self-test` mutates `src/` upper slice bounds, `checked_mul(kv_dim)`, comments out `let kv = h / kv_mul;`, mutates `layer_end`, and weakens an `exec_*` slice in `verus/kv_cache_bounds.rs` — 5/5 rejected in CI |
+| `verus/check_citations.py` | built-in `--self-test` mutates `src/` upper slice bounds, `checked_mul(kv_dim)`, line/block comments, string-literal spoofing, token-boundary prefix (`0` -> `0x1`), `layer_end`, and weakens an `exec_*` slice in `verus/kv_cache_bounds.rs` — 8/8 rejected in CI |
 | CI workflow wiring | every `steps.<id>.outputs.<name>` resolves to a step that writes it, every `run:` block parses as bash, no `\|\| true` outside comments |
 | Verus itself | `--no-cheating` rejects `assume` / `admit` / `external_body`; the unmutated baseline is run first so "24 verified" cannot mean "the file does not parse" |
 

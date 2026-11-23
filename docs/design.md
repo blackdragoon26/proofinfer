@@ -123,12 +123,14 @@ would be actively misleading.
 
 So `verus/check_citations.py` checks the link in both directions. Every symbol
 the proof and its README cite (`ops.rs::attention`, `model.rs::State::forward`,
-etc.) is resolved in `src/` after stripping `//` comments and string literals,
-and checked for every required normalized expression — including full lower and
-upper slice bounds and `checked_mul` chains. Paired entries are checked against
-the `exec_*` bodies in `verus/kv_cache_bounds.rs` too, so weakening the Verus
-side fails just like drifting `src/`. Prose<->registry coverage is bidirectional,
-and `--self-test` runs five in-memory mutations across both files in CI. Stdlib
+etc.) is resolved in `src/` via a Rust tokenizer (skipping `//` and nested
+`/* ... */` comments, treating string literals as atomic tokens so string
+contents cannot satisfy code checks, and matching on full token boundaries) and
+checked for every required expression — including full lower and upper slice
+bounds and `checked_mul` chains. Paired entries are checked against the
+`exec_*` bodies in `verus/kv_cache_bounds.rs` too, so weakening the Verus side
+fails just like drifting `src/`. Prose<->registry coverage is bidirectional,
+and `--self-test` runs in-memory mutations across both files in CI. Stdlib
 only, so it costs nothing.
 
 What it still does not check is semantic equivalence across un-cited code. An

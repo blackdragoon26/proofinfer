@@ -28,14 +28,14 @@ Full detail, including how each check was shown to be able to fail, is in
 | Mutation: differential harness | 10/10 caught |
 | Mutation: Rust test suite | 21/21 caught |
 | Verus `--no-cheating` | 24 verified, 0 errors |
-| Rust tests | 83, green in debug **and** release (MSRV 1.70.0) |
+| Rust tests | 84, green in debug **and** release (MSRV 1.70.0) |
 | Throughput | 835 tok/s single-threaded (5.4x over the naive dot product) |
 
 ## Quick start
 
 ```sh
 cargo build --release --locked
-cargo test --locked                     # 83 tests (debug + release)
+cargo test --locked                     # 84 tests (debug + release)
 ```
 
 Generate from text, with a real checkpoint:

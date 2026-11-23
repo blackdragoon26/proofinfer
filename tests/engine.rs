@@ -604,3 +604,19 @@ fn generate_rejects_overflowing_token_count() {
         "expected TooManyTokens on usize::MAX, got {err:?}"
     );
 }
+
+#[test]
+fn generate_rejects_nan_logits_even_at_bos_index() {
+    // Regression: if logit[BOS_ID] (index 1) is NaN, argmax returns (1, NaN).
+    // `generate` must report NonFiniteLogit instead of treating index 1 as BOS
+    // termination and returning Ok([]).
+    let mut w = tiny();
+    let d = w.config.dim;
+    let mut cls = w.tok_embedding.clone();
+    cls[d] = f32::NAN; // row 1 (BOS_ID), first coefficient
+    w.wcls = Some(cls);
+
+    let mut s = State::new(&w.config).unwrap();
+    let err = generate(&w, &mut s, &[2], 4).unwrap_err();
+    assert_eq!(err, proofinfer::model::RunError::NonFiniteLogit { pos: 0 });
+}

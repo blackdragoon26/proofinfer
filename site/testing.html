@@ -87,7 +87,7 @@
 </ul>
 
 <h4>Rust tests, and proof they can fail</h4>
-<p>83 tests, passing in both release and debug (debug matters: it enables integer overflow checks, which is where a wrapping size computation in the loader would show up), and tested on the documented MSRV (<code>1.70.0</code>) as well as stable.</p>
+<p>84 tests, passing in both release and debug (debug matters: it enables integer overflow checks, which is where a wrapping size computation in the loader would show up), and tested on the documented MSRV (<code>1.70.0</code>) as well as stable.</p>
 
 <table>
 <thead><tr><th>suite</th><th>tests</th><th>what it covers</th></tr></thead>
@@ -96,7 +96,7 @@
 <tr><td><code>src/main.rs</code></td><td>2</td><td>raw-byte <code>safe_print</code> parity with <code>run.c</code> and clean <code>BrokenPipe</code> handling</td></tr>
 <tr><td><code>tests/loader.rs</code></td><td>18</td><td>totality over hostile input, 2000 pseudo-random buffers, overflow, tensor ordering</td></tr>
 <tr><td><code>tests/tokenizer.rs</code></td><td>18</td><td>exact conformance to Meta's published token ids, hostile headers, raw-byte decode, byte fallback, round trips</td></tr>
-<tr><td><code>tests/engine.rs</code></td><td>21</td><td>causality, determinism, BOS termination, <code>State::reset</code> equivalence, config-mismatch rejection, <code>State::new</code> overflow/zero-field rejection, <code>argmax</code> totality on empty and NaN</td></tr>
+<tr><td><code>tests/engine.rs</code></td><td>22</td><td>causality, determinism, BOS termination, <code>State::reset</code> equivalence, config-mismatch rejection, <code>State::new</code> overflow/zero-field rejection, <code>argmax</code> totality on empty/NaN, <code>generate</code> NaN rejection</td></tr>
 </tbody></table>
 
 <p>But a passing suite only says the tests agree with the code. It does not say they can <em>notice</em> disagreement, so <code>reference/mutation_check_tests.py</code> injects 21 realistic bugs one at a time into a minimal temporary copy of the crate and requires every mutant to <strong>compile cleanly</strong> (<code>cargo test --offline --locked --no-run</code>) and then fail at least one named test (<code>test ... FAILED</code>) inside a 60-second timeout. Compile errors, timeouts, signals, and zero-test-failed exits are all harness failures rather than false "caught" counts. <strong>21/21 caught.</strong> It is the same discipline as <code>mutation_check.py</code>, pointed at the other half of the project: that one proves the differential harness can fail, this one proves the Rust tests can.</p>
@@ -117,11 +117,11 @@
 <thead><tr><th>check</th><th>how it was shown to fail</th></tr></thead>
 <tbody>
 <tr><td><code>diff_test.py</code> (6 configs)</td><td>10 injected bugs, <code>mutation_check.py</code>, 10/10 (requires a named <code>FAIL</code> config; crashes and harness errors are rejected)</td></tr>
-<tr><td><code>cargo test</code> (83 tests)</td><td>21 injected bugs, <code>mutation_check_tests.py</code>, 21/21 (requires <code>--no-run</code> compile success plus at least one <code>test ... FAILED</code>; syntax errors fail as <code>COMPILE_ERROR</code>)</td></tr>
+<tr><td><code>cargo test</code> (84 tests)</td><td>21 injected bugs, <code>mutation_check_tests.py</code>, 21/21 (requires <code>--no-run</code> compile success plus at least one <code>test ... FAILED</code>; syntax errors fail as <code>COMPILE_ERROR</code>)</td></tr>
 <tr><td>byte-identical greedy output</td><td>a RoPE-less mutant binary: <code>bench.py</code> reports <code>DIFFERENT</code> and exits 1</td></tr>
 <tr><td>zero-dependency &amp; lockfile v3 assertion</td><td>a <code>Cargo.lock</code> with a second package, with zero packages, naming another package, or upgraded past <code>version = 3</code> — all rejected</td></tr>
 <tr><td><code>reference/check_provenance.py</code></td><td>1-byte flip in a vendored file and an unlisted extra file in a scratch copy — both rejected</td></tr>
-<tr><td><code>verus/check_citations.py</code></td><td>built-in <code>--self-test</code> mutates <code>src/</code> upper slice bounds, <code>checked_mul(kv_dim)</code>, comments out <code>let kv = h / kv_mul;</code>, mutates <code>layer_end</code>, and weakens an <code>exec_*</code> slice in <code>verus/kv_cache_bounds.rs</code> — 5/5 rejected in CI</td></tr>
+<tr><td><code>verus/check_citations.py</code></td><td>built-in <code>--self-test</code> mutates <code>src/</code> upper slice bounds, <code>checked_mul(kv_dim)</code>, line/block comments, string-literal spoofing, token-boundary prefix (<code>0</code> -&gt; <code>0x1</code>), <code>layer_end</code>, and weakens an <code>exec_*</code> slice in <code>verus/kv_cache_bounds.rs</code> — 8/8 rejected in CI</td></tr>
 <tr><td>CI workflow wiring</td><td>every <code>steps.&lt;id&gt;.outputs.&lt;name&gt;</code> resolves to a step that writes it, every <code>run:</code> block parses as bash, no <code>|| true</code> outside comments</td></tr>
 <tr><td>Verus itself</td><td><code>--no-cheating</code> rejects <code>assume</code> / <code>admit</code> / <code>external_body</code>; the unmutated baseline is run first so "24 verified" cannot mean "the file does not parse"</td></tr>
 </tbody></table>

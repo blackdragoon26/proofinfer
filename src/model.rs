@@ -74,6 +74,7 @@ pub enum RunError {
     TooManyTokens { requested: usize, seq_len: usize },
     EmptyPrompt,
     StateMismatch { detail: String },
+    NonFiniteLogit { pos: usize },
 }
 
 impl fmt::Display for RunError {
@@ -93,6 +94,9 @@ impl fmt::Display for RunError {
             ),
             RunError::EmptyPrompt => write!(f, "the prompt contains no tokens"),
             RunError::StateMismatch { detail } => write!(f, "state mismatch: {detail}"),
+            RunError::NonFiniteLogit { pos } => {
+                write!(f, "non-finite (NaN) logit produced at position {pos}")
+            }
         }
     }
 }
@@ -874,6 +878,16 @@ pub fn argmax(logits: &[f32]) -> Option<(usize, f32)> {
 /// reference: with a BOS-terminated checkpoint, stopping on EOS means never
 /// stopping, and the generated text diverges from `run.c` at exactly the
 /// position where the first document ended.
+fn pick_next_token(logits: &[f32], pos: usize) -> Result<u32, RunError> {
+    let (idx, val) = argmax(logits).ok_or_else(|| RunError::StateMismatch {
+        detail: "forward returned empty logits".into(),
+    })?;
+    if val.is_nan() {
+        return Err(RunError::NonFiniteLogit { pos });
+    }
+    Ok(idx as u32)
+}
+
 pub fn generate(
     w: &Weights,
     state: &mut State,
@@ -904,11 +918,7 @@ pub fn generate(
     for (pos, &t) in prompt.iter().enumerate() {
         let logits = state.forward(w, t, pos)?;
         if pos + 1 == prompt.len() {
-            next = argmax(logits)
-                .ok_or_else(|| RunError::StateMismatch {
-                    detail: "forward returned empty logits".into(),
-                })?
-                .0 as u32;
+            next = pick_next_token(logits, pos)?;
         }
     }
 
@@ -927,12 +937,8 @@ pub fn generate(
             break;
         }
         let logits = state.forward(w, next, pos)?;
+        next = pick_next_token(logits, pos)?;
         pos += 1;
-        next = argmax(logits)
-            .ok_or_else(|| RunError::StateMismatch {
-                detail: "forward returned empty logits".into(),
-            })?
-            .0 as u32;
     }
 
     Ok(generated)
