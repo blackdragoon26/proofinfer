@@ -171,7 +171,7 @@ def main() -> int:
 
     engines = [tiny]
     for c in args.run_c:
-        p = Path(c)
+        p = Path(c).resolve()
         if not p.exists():
             print(f"error: {c} does not exist", file=sys.stderr)
             return 2
