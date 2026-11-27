@@ -28,14 +28,14 @@ Full detail, including how each check was shown to be able to fail, is in
 | Mutation: differential harness | 10/10 caught |
 | Mutation: Rust test suite | 21/21 caught |
 | Verus `--no-cheating` | 36 verified, 0 errors |
-| Rust tests | 84, green in debug **and** release (MSRV 1.70.0) |
-| Throughput | 835 tok/s single-threaded (5.4x over the naive dot product) |
+| Rust tests | 90, green in debug **and** release (MSRV 1.70.0) |
+| Throughput | 835 tok/s single-threaded (5.4x over the naive dot product; optional `-t/--threads`) |
 
 ## Quick start
 
 ```sh
 cargo build --release --locked
-cargo test --locked                     # 84 tests (debug + release)
+cargo test --locked                     # 90 tests (debug + release)
 ```
 
 Generate from text, with a real checkpoint:
@@ -55,6 +55,11 @@ PY
 
 ./target/release/proofinfer stories15M.bin \
     -z reference/llama2c/tokenizer.bin -i "Once upon a time" -n 248
+
+# Optional multi-threaded matmul and deterministic seeded sampling:
+./target/release/proofinfer stories15M.bin \
+    -z reference/llama2c/tokenizer.bin -i "Once upon a time" -n 248 \
+    -t 4 --temp 0.8 --top-p 0.9 --seed 42
 ```
 
 ## Local verification checklist

@@ -28,8 +28,8 @@
   CONTEXT.md                 design notes: format, forward pass, gotchas, TCB
   src/
     lib.rs                   module map
-    ops.rs                   kernels: rmsnorm, softmax, silu, matmul, RoPE, GQA
-    model.rs                 config, hardened checkpoint loader, State, forward, generate
+    ops.rs                   kernels: rmsnorm, softmax, silu, matmul (with optional std::thread::scope parallelism), RoPE, GQA
+    model.rs                 config, hardened checkpoint loader, State, forward, streaming/sampled generate
     tokenizer.rs             BPE vocabulary reader, encoder, decoder
     main.rs                  CLI
   tests/
@@ -64,7 +64,7 @@
 
 <p><strong><code>forward</code> allocates nothing.</strong> Every buffer lives in <code>State</code> and is written in place, so the memory footprint of decoding is a sum you can write down: scratch is a handful of vectors, and the cache dominates at <code>2 * n_layers * seq_len * kv_dim</code>.</p>
 
-<p><strong>Greedy only, no sampling.</strong> Sampling needs an RNG, and an RNG would make the byte-identical comparison against <code>run.c</code> impossible unless both sides consumed the identical stream. Greedy decoding is a pure function of the weights and the prompt, so two implementations that agree on the maths produce byte-identical output — a far stronger claim than "the samples look similar".</p>
+<p><strong>Greedy by default, with optional deterministic sampling and threading.</strong> Default decoding (<code>--temp 0.0</code>, <code>--threads 1</code>) is strictly greedy argmax: a pure function of the weights and the prompt, so two implementations that agree on the maths produce byte-identical output against <code>run.c</code>. When interactive variety or multi-core throughput is wanted, <code>--temp</code>, <code>--top-p</code>, and <code>--seed</code> enable deterministic nucleus sampling backed by <code>xorshift64*</code> (matching <code>llama2.c</code>'s <code>random_u32</code>), and <code>-t/--threads</code> partitions <code>matmul</code> output rows across <code>std::thread::scope</code> workers with zero external crates and bit-for-bit identical arithmetic. Generated tokens stream to stdout as each step finishes rather than buffering until completion.</p>
 
 <p><strong>Bugs found by the byte-identity check that no unit test caught.</strong> Generation originally stopped on EOS; llama2.c stops on BOS, which is the document delimiter these models are trained with, so with stories15M our output ran straight past the end of the first story. Output was also printed by decoding the whole sequence at once, whereas <code>run.c</code> prints per token through <code>safe_printf</code>, which drops single non-printable bytes. Both were found by <code>bench.py</code> and neither was findable from the differential test, which does not look at text at all.</p>
 
@@ -113,11 +113,11 @@ verification results:: 36 verified, 0 errors</code></pre>
 
 <p>That run is also what justified the ANSI-colour fix in the toolchain-discovery step: on Linux the parse still had to strip the escape sequence to recover <code>1.98.1-x86_64-unknown-linux-gnu</code> from the same coloured error message.</p>
 
-<p><strong>What is still unexecuted, precisely:</strong> the GitHub-hosted actions themselves — <code>actions/checkout</code>, <code>actions/cache</code>, <code>actions/setup-python</code> and <code>dtolnay/rust-toolchain</code>. Those are standard, they are not written here, and the container provided its own <code>curl</code>/<code>unzip</code>/<code>python3</code>/<code>rustup</code> in their place. The remaining risk on a first CI run is therefore in the YAML and the runner environment, not in the commands this repository contributes. If the <code>proof</code> job does go red, the other three jobs are unaffected and the log will name the step.</p>
+<p>All six GitHub Actions CI jobs (<code>rust</code>, <code>msrv</code>, <code>site-and-provenance</code>, <code>differential</code>, <code>real-weights</code>, and <code>proof</code>) run on GitHub-hosted <code>ubuntu-latest</code> runners on every push and pull request, with no <code>|| true</code> and no <code>continue-on-error</code>.</p>
 
 <p>Nothing else here is machine-checked. The loader's totality rests on 2000 fuzz iterations plus reasoning, not a proof; the differential test establishes agreement with a reference on six configurations and one trained checkpoint, not equivalence to the architecture in general.</p>
 
-<p>Two other things were scoped and deliberately <strong>not</strong> done, rather than half-done: a differential test against <strong>vLLM</strong> (needs a GPU and a Hugging Face export path, and the harness is written so that adding a third oracle is a new config table rather than a new file), and <strong>Triton</strong> kernels for rmsnorm, softmax and matmul (a benchmarking exercise with no bearing on whether the engine is correct, which is the claim this repository makes). The measurement in this repository is CPU and single-threaded throughout; nothing here says anything about GPU inference.</p>
+<p>Two other things were scoped and deliberately <strong>not</strong> done, rather than half-done: a differential test against <strong>vLLM</strong> (needs a GPU and a Hugging Face export path, and the harness is written so that adding a third oracle is a new config table rather than a new file), and <strong>Triton</strong> kernels for rmsnorm, softmax and matmul (a benchmarking exercise with no bearing on whether the engine is correct, which is the claim this repository makes). The benchmark measurements in this repository are CPU and single-threaded by default (with optional multi-threaded matmul via <code>--threads</code>); nothing here says anything about GPU inference.</p>
 
 <h3>Credits</h3>
 <p>The PyTorch reference model, the legacy export format, the tokenizer format, the C engine, and the expected token id vectors all come from <a href="https://github.com/karpathy/llama2.c">karpathy/llama2.c</a>, MIT licensed. The files under <code>reference/llama2c/</code> are vendored <strong>byte-for-byte unmodified</strong>; <code>reference/llama2c/PROVENANCE.md</code> records the sha256 of each so a reviewer can verify that, and it matters more than it might look — a differential test against a reference that has been edited is worth nothing.</p>

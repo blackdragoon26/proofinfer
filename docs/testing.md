@@ -98,17 +98,17 @@ Two guards keep that number honest:
 
 #### Rust tests, and proof they can fail
 
-84 tests, passing in both release and debug (debug matters: it enables integer
+90 tests, passing in both release and debug (debug matters: it enables integer
 overflow checks, which is where a wrapping size computation in the loader would
 show up), and tested on the documented MSRV (`1.70.0`) as well as stable.
 
 | suite | tests | what it covers |
 |---|---|---|
-| `src/ops.rs` | 24 | kernels against hand-computed answers, empty-slice totality, RoPE invariants *and* its frequency schedule, causality of the attention window, `dot` across every length mod 8 |
-| `src/main.rs` | 2 | raw-byte `safe_print` parity with `run.c` and clean `BrokenPipe` handling |
+| `src/ops.rs` | 26 | kernels against hand-computed answers, empty-slice totality, all-`-inf` softmax stability, bit-identical parallel matmul, RoPE invariants *and* its frequency schedule, causality of the attention window, `dot` across every length mod 8 |
+| `src/main.rs` | 3 | raw-byte `safe_print` parity with `run.c`, clean `BrokenPipe` handling, CLI validation for `--threads`, `--temp`, `--top-p`, and `--seed` |
 | `tests/loader.rs` | 18 | totality over hostile input, 2000 pseudo-random buffers, overflow, tensor ordering |
 | `tests/tokenizer.rs` | 18 | exact conformance to Meta's published token ids, hostile headers, raw-byte decode, byte fallback, round trips |
-| `tests/engine.rs` | 22 | causality, determinism, BOS termination, `State::reset` equivalence, config-mismatch rejection, `State::new` overflow/zero-field rejection, `argmax` totality on empty/NaN, `generate` NaN rejection |
+| `tests/engine.rs` | 25 | causality, determinism, BOS termination, streaming generation and early stop, seeded temperature/top-p sampling, `State::reset` equivalence, config-mismatch rejection, `State::new` overflow/zero-field rejection, `argmax` totality on empty/NaN, `generate` NaN and infinity rejection |
 
 But a passing suite only says the tests agree with the code. It does not say
 they can *notice* disagreement, so `reference/mutation_check_tests.py` injects 21
@@ -153,7 +153,7 @@ red. This is the inventory:
 | check | how it was shown to fail |
 |---|---|
 | `diff_test.py` (6 configs) | 10 injected bugs, `mutation_check.py`, 10/10 (requires a named `FAIL` config; crashes and harness errors are rejected) |
-| `cargo test` (84 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 (requires `--no-run` compile success plus at least one `test ... FAILED`; syntax errors fail as `COMPILE_ERROR`) |
+| `cargo test` (90 tests) | 21 injected bugs, `mutation_check_tests.py`, 21/21 (requires `--no-run` compile success plus at least one `test ... FAILED`; syntax errors fail as `COMPILE_ERROR`) |
 | byte-identical greedy output | a RoPE-less mutant binary: `bench.py` reports `DIFFERENT` and exits 1 |
 | zero-dependency & lockfile v3 assertion | a `Cargo.lock` with a second package, with zero packages, naming another package, or upgraded past `version = 3` — all rejected |
 | `reference/check_provenance.py` | 1-byte flip in a vendored file and an unlisted extra file in a scratch copy — both rejected |

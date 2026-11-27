@@ -169,8 +169,12 @@ impl Tokenizer {
                 Ok(s)
             };
 
-        let raw_max_len =
-            i32::from_le_bytes(take(&mut pos, 4, "max_token_length")?.try_into().unwrap());
+        let take4 = |pos: &mut usize, what: &'static str| -> Result<[u8; 4], TokenizerError> {
+            let s = take(pos, 4, what)?;
+            Ok([s[0], s[1], s[2], s[3]])
+        };
+
+        let raw_max_len = i32::from_le_bytes(take4(&mut pos, "max_token_length")?);
         if raw_max_len < 0 {
             return Err(TokenizerError::InvalidFormat(format!(
                 "max_token_length must be non-negative, got {raw_max_len}"
@@ -196,15 +200,8 @@ impl Tokenizer {
         let mut scores = Vec::with_capacity(vocab_size);
 
         for id in 0..vocab_size {
-            let score =
-                f32::from_le_bytes(take(&mut pos, 4, "vocab score")?.try_into().map_err(|_| {
-                    TokenizerError::Truncated {
-                        what: "vocab score",
-                        need: 4,
-                        have: 0,
-                    }
-                })?);
-            let len = i32::from_le_bytes(take(&mut pos, 4, "vocab length")?.try_into().unwrap());
+            let score = f32::from_le_bytes(take4(&mut pos, "vocab score")?);
+            let len = i32::from_le_bytes(take4(&mut pos, "vocab length")?);
             // A negative length is a malformed record, not a request to read
             // backwards.
             if len < 0 {

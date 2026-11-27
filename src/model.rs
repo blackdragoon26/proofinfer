@@ -75,6 +75,7 @@ pub enum RunError {
     EmptyPrompt,
     StateMismatch { detail: String },
     NonFiniteLogit { pos: usize },
+    InvalidSampleConfig { detail: String },
 }
 
 impl fmt::Display for RunError {
@@ -95,7 +96,10 @@ impl fmt::Display for RunError {
             RunError::EmptyPrompt => write!(f, "the prompt contains no tokens"),
             RunError::StateMismatch { detail } => write!(f, "state mismatch: {detail}"),
             RunError::NonFiniteLogit { pos } => {
-                write!(f, "non-finite (NaN) logit produced at position {pos}")
+                write!(f, "non-finite (NaN or inf) logit produced at position {pos}")
+            }
+            RunError::InvalidSampleConfig { detail } => {
+                write!(f, "invalid sampling configuration: {detail}")
             }
         }
     }
@@ -845,55 +849,171 @@ pub fn argmax(logits: &[f32]) -> Option<(usize, f32)> {
     Some((best_idx, best_val))
 }
 
-/// Greedy-decode up to `n` tokens after `prompt`.
+/// Sampling hyperparameters for [`generate_sampled_stream`].
 ///
-/// Greedy means always taking the argmax: no temperature, no top-k, no
-/// sampling. That is a deliberate limitation. Sampling needs an RNG, and an RNG
-/// would make the byte-identical comparison against llama2.c's `run.c`
-/// impossible unless both sides consumed the identical stream. Greedy decoding
-/// is a pure function of the weights and the prompt, so two implementations that
-/// agree on the maths produce *byte-identical* output - a far stronger claim
-/// than "the text looks about right".
-///
-/// # Forward-pass accounting
-///
-/// The prompt fills positions `0..prompt.len()`. The logits produced by the
-/// *last* prompt token are the ones that predict the first generated token, so
-/// that pass is not wasted. Each subsequent generated token needs exactly one
-/// more pass, and the loop below stops before issuing a pass whose output it
-/// would not use. Total passes: `prompt.len() + n.saturating_sub(1)`.
-///
-/// Returns the generated tokens, excluding the prompt.
-///
-/// # Termination
-///
-/// Generation stops when the model emits **BOS**, not EOS. That is
-/// llama2.c's rule (`if (next == 1) break;`) and it is the rule the models were
-/// trained with: BOS is the document delimiter, so a model that has finished a
-/// document emits BOS to start the next one, and that is the natural place to
-/// stop. A model trained to emit EOS instead will simply run to `n`, which is a
-/// harmless loss of throughput rather than a wrong answer.
-///
-/// This is the kind of detail that only shows up when you diff against the
-/// reference: with a BOS-terminated checkpoint, stopping on EOS means never
-/// stopping, and the generated text diverges from `run.c` at exactly the
-/// position where the first document ended.
-fn pick_next_token(logits: &[f32], pos: usize) -> Result<u32, RunError> {
-    let (idx, val) = argmax(logits).ok_or_else(|| RunError::StateMismatch {
-        detail: "forward returned empty logits".into(),
-    })?;
-    if val.is_nan() {
-        return Err(RunError::NonFiniteLogit { pos });
-    }
-    Ok(idx as u32)
+/// The default (`temperature = 0.0`) performs strictly greedy argmax decoding
+/// and ignores `top_p` and `seed`, preserving byte-identical output against
+/// `llama2.c`'s `run.c`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleConfig {
+    /// Softmax temperature. `0.0` selects greedy decoding; positive finite
+    /// values scale logits by `1 / temperature` before sampling.
+    pub temperature: f32,
+    /// Nucleus (top-p) cumulative probability threshold in `(0.0, 1.0]`.
+    /// `1.0` samples from the full distribution without truncation.
+    pub top_p: f32,
+    /// Seed for the deterministic `xorshift64*` PRNG (matching `llama2.c`'s
+    /// `random_u32`). `0` is mapped to `1` so the generator never stalls at zero.
+    pub seed: u64,
 }
 
-pub fn generate(
+impl Default for SampleConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            top_p: 0.9,
+            seed: 0,
+        }
+    }
+}
+
+impl SampleConfig {
+    /// Validate sampling hyperparameters.
+    pub fn validate(&self) -> Result<(), RunError> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(RunError::InvalidSampleConfig {
+                detail: format!(
+                    "temperature must be finite and non-negative, got {}",
+                    self.temperature
+                ),
+            });
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err(RunError::InvalidSampleConfig {
+                detail: format!("top_p must be in (0.0, 1.0], got {}", self.top_p),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Deterministic `xorshift64*` PRNG matching `llama2.c`'s `random_u32`.
+struct Rng {
+    state: u64,
+}
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        let mut s = self.state;
+        s ^= s >> 12;
+        s ^= s << 25;
+        s ^= s >> 27;
+        self.state = s;
+        (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u32() >> 8) as f32 / 16_777_216.0
+    }
+}
+
+fn select_next_token(
+    logits: &[f32],
+    pos: usize,
+    sample: SampleConfig,
+    rng: &mut Rng,
+    probs: &mut Vec<f32>,
+    candidates: &mut Vec<(usize, f32)>,
+) -> Result<u32, RunError> {
+    if logits.is_empty() {
+        return Err(RunError::StateMismatch {
+            detail: "forward returned empty logits".into(),
+        });
+    }
+    if logits.iter().any(|v| !v.is_finite()) {
+        return Err(RunError::NonFiniteLogit { pos });
+    }
+    if sample.temperature == 0.0 {
+        let (idx, _) = argmax(logits).ok_or_else(|| RunError::StateMismatch {
+            detail: "forward returned empty logits".into(),
+        })?;
+        return Ok(idx as u32);
+    }
+
+    // Shift by max before dividing by temperature so very small positive
+    // temperatures cannot overflow `(logit - max) / temperature` to +inf.
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    probs.clear();
+    probs.extend(logits.iter().map(|&v| (v - max_logit) / sample.temperature));
+    ops::softmax(probs);
+
+    let coin = rng.next_f32();
+    if sample.top_p >= 1.0 {
+        let mut cdf = 0.0f32;
+        for (i, &p) in probs.iter().enumerate() {
+            cdf += p;
+            if coin < cdf {
+                return Ok(i as u32);
+            }
+        }
+        return Ok((probs.len() - 1) as u32);
+    }
+
+    candidates.clear();
+    for (i, &p) in probs.iter().enumerate() {
+        if p > 0.0 {
+            candidates.push((i, p));
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut cumulative = 0.0f32;
+    let mut last_idx = candidates.len() - 1;
+    for (idx, &(_, p)) in candidates.iter().enumerate() {
+        cumulative += p;
+        if cumulative > sample.top_p {
+            last_idx = idx;
+            break;
+        }
+    }
+
+    let r = coin * cumulative;
+    let mut cdf = 0.0f32;
+    for &(token_idx, p) in &candidates[..=last_idx] {
+        cdf += p;
+        if r < cdf {
+            return Ok(token_idx as u32);
+        }
+    }
+    Ok(candidates[last_idx].0 as u32)
+}
+
+/// Generate up to `n` tokens after `prompt`, calling `on_token` for each
+/// emitted token as soon as it is produced.
+///
+/// Returning `false` from `on_token` stops generation early without error.
+/// Returns the number of tokens delivered to `on_token`.
+pub fn generate_sampled_stream<F>(
     w: &Weights,
     state: &mut State,
     prompt: &[u32],
     n: usize,
-) -> Result<Vec<u32>, RunError> {
+    sample: SampleConfig,
+    mut on_token: F,
+) -> Result<usize, RunError>
+where
+    F: FnMut(u32) -> bool,
+{
+    sample.validate()?;
     if prompt.is_empty() {
         // An empty prompt has no last token to condition on, so there is
         // nothing to continue from. Silently starting from BOS instead would
@@ -911,35 +1031,98 @@ pub fn generate(
         });
     }
 
+    let mut rng = Rng::new(sample.seed);
+    let mut probs: Vec<f32> = Vec::new();
+    let mut candidates: Vec<(usize, f32)> = Vec::new();
+
     // Consume the prompt. Only the final iteration's logits are used, and the
-    // argmax is taken immediately so the borrow on `state` ends before the
+    // next token is picked immediately so the borrow on `state` ends before the
     // generation loop begins.
     let mut next = 0u32;
     for (pos, &t) in prompt.iter().enumerate() {
         let logits = state.forward(w, t, pos)?;
         if pos + 1 == prompt.len() {
-            next = pick_next_token(logits, pos)?;
+            next = select_next_token(logits, pos, sample, &mut rng, &mut probs, &mut candidates)?;
         }
     }
 
-    let mut generated: Vec<u32> = Vec::with_capacity(n);
+    let mut emitted = 0usize;
     // The next token to be emitted has not been forwarded yet; it will occupy
     // position `prompt.len()`.
     let mut pos = prompt.len();
-    while generated.len() < n {
+    while emitted < n {
         if next == crate::tokenizer::BOS_ID {
             break;
         }
-        generated.push(next);
-        if generated.len() == n {
+        emitted += 1;
+        if !on_token(next) {
+            break;
+        }
+        if emitted == n {
             // Emitting the last requested token; a further forward pass would
             // only compute logits nobody reads.
             break;
         }
         let logits = state.forward(w, next, pos)?;
-        next = pick_next_token(logits, pos)?;
+        next = select_next_token(logits, pos, sample, &mut rng, &mut probs, &mut candidates)?;
         pos += 1;
     }
 
+    Ok(emitted)
+}
+
+/// Greedy-decode up to `n` tokens after `prompt`, streaming each token to
+/// `on_token` as it is produced.
+pub fn generate_stream<F>(
+    w: &Weights,
+    state: &mut State,
+    prompt: &[u32],
+    n: usize,
+    on_token: F,
+) -> Result<usize, RunError>
+where
+    F: FnMut(u32) -> bool,
+{
+    generate_sampled_stream(w, state, prompt, n, SampleConfig::default(), on_token)
+}
+
+/// Greedy-decode up to `n` tokens after `prompt`.
+///
+/// Greedy means always taking the argmax: no temperature, no top-k, no
+/// sampling. That is the default mode because greedy decoding is a pure
+/// function of the weights and the prompt, so two implementations that agree on
+/// the maths produce *byte-identical* output - a far stronger claim than "the
+/// text looks about right". For optional seeded temperature/top-p sampling, use
+/// [`generate_sampled_stream`].
+///
+/// # Forward-pass accounting
+///
+/// The prompt fills positions `0..prompt.len()`. The logits produced by the
+/// *last* prompt token are the ones that predict the first generated token, so
+/// that pass is not wasted. Each subsequent generated token needs exactly one
+/// more pass, and the loop stops before issuing a pass whose output it would
+/// not use. Total passes: `prompt.len() + n.saturating_sub(1)`.
+///
+/// Returns the generated tokens, excluding the prompt.
+///
+/// # Termination
+///
+/// Generation stops when the model emits **BOS**, not EOS. That is
+/// llama2.c's rule (`if (next == 1) break;`) and it is the rule the models were
+/// trained with: BOS is the document delimiter, so a model that has finished a
+/// document emits BOS to start the next one, and that is the natural place to
+/// stop. A model trained to emit EOS instead will simply run to `n`, which is a
+/// harmless loss of throughput rather than a wrong answer.
+pub fn generate(
+    w: &Weights,
+    state: &mut State,
+    prompt: &[u32],
+    n: usize,
+) -> Result<Vec<u32>, RunError> {
+    let mut generated: Vec<u32> = Vec::with_capacity(n.min(w.config.seq_len));
+    generate_stream(w, state, prompt, n, |token| {
+        generated.push(token);
+        true
+    })?;
     Ok(generated)
 }

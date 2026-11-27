@@ -16,7 +16,10 @@
 //!   the prompt. Two runs must produce identical token ids, because the
 //!   byte-identical comparison against llama2.c's `run.c` depends on it.
 
-use proofinfer::model::{argmax, generate, Config, State, Weights};
+use proofinfer::model::{
+    argmax, generate, generate_sampled_stream, generate_stream, Config, RunError, SampleConfig,
+    State, Weights,
+};
 
 /// Build a small but well-formed legacy-format checkpoint.
 ///
@@ -619,4 +622,134 @@ fn generate_rejects_nan_logits_even_at_bos_index() {
     let mut s = State::new(&w.config).unwrap();
     let err = generate(&w, &mut s, &[2], 4).unwrap_err();
     assert_eq!(err, proofinfer::model::RunError::NonFiniteLogit { pos: 0 });
+}
+
+#[test]
+fn generate_rejects_infinite_logits() {
+    for bad in [f32::INFINITY, f32::NEG_INFINITY] {
+        let mut w = tiny();
+        let d = w.config.dim;
+        let mut cls = w.tok_embedding.clone();
+        cls[2 * d] = bad;
+        w.wcls = Some(cls);
+
+        let mut s = State::new(&w.config).unwrap();
+        let err = generate(&w, &mut s, &[2], 4).unwrap_err();
+        assert_eq!(err, RunError::NonFiniteLogit { pos: 0 });
+    }
+}
+
+#[test]
+fn generate_stream_matches_generate_and_supports_early_stop() {
+    let w = gqa();
+    let prompt = vec![1u32, 5, 9, 13];
+    let batch = generate(&w, &mut State::new(&w.config).unwrap(), &prompt, 10).unwrap();
+
+    let mut streamed = Vec::new();
+    let count = generate_stream(&w, &mut State::new(&w.config).unwrap(), &prompt, 10, |t| {
+        streamed.push(t);
+        true
+    })
+    .unwrap();
+    assert_eq!(count, batch.len());
+    assert_eq!(streamed, batch);
+
+    // Stopping early after 3 tokens halts generation cleanly.
+    let mut prefix = Vec::new();
+    let stopped = generate_stream(&w, &mut State::new(&w.config).unwrap(), &prompt, 10, |t| {
+        prefix.push(t);
+        prefix.len() < 3
+    })
+    .unwrap();
+    assert_eq!(stopped, 3);
+    assert_eq!(prefix, &batch[..3]);
+}
+
+#[test]
+fn sampled_generation_is_deterministic_and_validates_config() {
+    let w = gqa();
+    let prompt = vec![1u32, 5, 9];
+
+    // Greedy SampleConfig (temperature = 0.0) matches generate exactly.
+    let greedy = generate(&w, &mut State::new(&w.config).unwrap(), &prompt, 8).unwrap();
+    let mut from_sample = Vec::new();
+    generate_sampled_stream(
+        &w,
+        &mut State::new(&w.config).unwrap(),
+        &prompt,
+        8,
+        SampleConfig::default(),
+        |t| {
+            from_sample.push(t);
+            true
+        },
+    )
+    .unwrap();
+    assert_eq!(from_sample, greedy);
+
+    // Same seed + temperature + top_p produces identical token sequences.
+    let cfg = SampleConfig {
+        temperature: 0.9,
+        top_p: 0.85,
+        seed: 12345,
+    };
+    let run_sampled = |c: SampleConfig| -> Vec<u32> {
+        let mut out = Vec::new();
+        generate_sampled_stream(&w, &mut State::new(&w.config).unwrap(), &prompt, 8, c, |t| {
+            out.push(t);
+            true
+        })
+        .unwrap();
+        out
+    };
+    let a = run_sampled(cfg);
+    let b = run_sampled(cfg);
+    assert_eq!(a, b);
+    assert!(a.iter().all(|&t| (t as usize) < w.config.vocab_size));
+
+    // Tiny positive temperature + tiny top_p must not overflow or panic.
+    let sharp = run_sampled(SampleConfig {
+        temperature: 1e-6,
+        top_p: 0.01,
+        seed: 0,
+    });
+    assert_eq!(sharp, greedy);
+
+    // Invalid configs fail cleanly before running forward.
+    for bad in [
+        SampleConfig {
+            temperature: -0.1,
+            top_p: 0.9,
+            seed: 1,
+        },
+        SampleConfig {
+            temperature: f32::NAN,
+            top_p: 0.9,
+            seed: 1,
+        },
+        SampleConfig {
+            temperature: 0.8,
+            top_p: 0.0,
+            seed: 1,
+        },
+        SampleConfig {
+            temperature: 0.8,
+            top_p: 1.1,
+            seed: 1,
+        },
+    ] {
+        let err = generate_sampled_stream(
+            &w,
+            &mut State::new(&w.config).unwrap(),
+            &prompt,
+            4,
+            bad,
+            |_| true,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RunError::InvalidSampleConfig { .. }),
+            "expected InvalidSampleConfig for {bad:?}, got {err:?}"
+        );
+    }
 }

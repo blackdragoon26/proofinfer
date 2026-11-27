@@ -31,19 +31,21 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use proofinfer::model::{self, State, Weights};
+use proofinfer::model::{self, SampleConfig, State, Weights};
+use proofinfer::ops;
 use proofinfer::tokenizer::Tokenizer;
 
 const USAGE: &str = "\
 proofinfer - a dependency-free Llama inference engine
 
 USAGE:
-    proofinfer <model.bin> -z <tokenizer.bin> -i <text> -n <count>
-    proofinfer <model.bin> --tokens <t0,t1,...> [--dump-logits <out.f32>]
+    proofinfer <model.bin> -z <tokenizer.bin> -i <text> -n <count> [OPTIONS]
+    proofinfer <model.bin> --tokens <t0,t1,...> [--dump-logits <out.f32>] [--threads <count>]
 
 MODES:
-    With -i/--input, the text is tokenised and <count> tokens are generated
-    greedily. Tokens per second is reported on stderr.
+    With -i/--input, the text is tokenised and up to <count> tokens are
+    streamed to stdout. Decoding is greedy by default (--temp 0), matching
+    run.c byte-for-byte. Tokens per second is reported on stderr.
 
     With --tokens, exactly those token ids are run at positions 0, 1, ... with
     no tokenisation and no sampling. This is the mode the differential test
@@ -53,6 +55,10 @@ OPTIONS:
     -z, --tokenizer <path>    BPE vocabulary (tokenizer.bin)
     -i, --input <text>        prompt text
     -n, --num-tokens <count>  tokens to generate (default 256)
+    -t, --threads <count>     worker threads for matmul (default 1)
+        --temp <float>        sampling temperature; 0 = greedy (default 0.0)
+        --top-p <float>       nucleus sampling cutoff in (0, 1] (default 0.9)
+        --seed <u64>          PRNG seed when --temp > 0 (default 0)
         --tokens <list>       comma-separated token ids, run verbatim
         --dump-logits <path>  write every step's logits as raw f32, one row
                               per position, little-endian
@@ -61,6 +67,8 @@ OPTIONS:
 
 EXAMPLES:
     proofinfer stories15M.bin -z tokenizer.bin -i \"Once upon a time\" -n 256
+    proofinfer stories15M.bin -z tokenizer.bin -i \"Once upon a time\" -n 256 -t 4
+    proofinfer stories15M.bin -z tokenizer.bin -i \"Once upon a time\" --temp 0.8 --top-p 0.9 --seed 42
     proofinfer tiny.bin --tokens 1,450,2462 --dump-logits out.f32
 ";
 
@@ -88,6 +96,8 @@ struct Args {
     tokenizer: Option<PathBuf>,
     input: Option<String>,
     num_tokens: usize,
+    threads: usize,
+    sample: SampleConfig,
     tokens: Option<Vec<u32>>,
     dump_logits: Option<PathBuf>,
 }
@@ -109,6 +119,10 @@ fn parse_args(argv: &[String]) -> Result<Action, CliError> {
     let mut tokenizer: Option<PathBuf> = None;
     let mut input: Option<String> = None;
     let mut num_tokens: Option<usize> = None;
+    let mut threads: Option<usize> = None;
+    let mut temp: Option<f32> = None;
+    let mut top_p: Option<f32> = None;
+    let mut seed: Option<u64> = None;
     let mut tokens: Option<Vec<u32>> = None;
     let mut dump_logits: Option<PathBuf> = None;
 
@@ -141,6 +155,10 @@ fn parse_args(argv: &[String]) -> Result<Action, CliError> {
             "-z" | "--tokenizer" => tokenizer = Some(PathBuf::from(take_value!("-z"))),
             "-i" | "--input" => input = Some(take_value!("-i")),
             "-n" | "--num-tokens" => num_tokens = Some(parse_count(&flag, &take_value!("-n"))?),
+            "-t" | "--threads" => threads = Some(parse_threads(&flag, &take_value!("-t"))?),
+            "--temp" => temp = Some(parse_f32(&flag, &take_value!("--temp"))?),
+            "--top-p" => top_p = Some(parse_f32(&flag, &take_value!("--top-p"))?),
+            "--seed" => seed = Some(parse_u64(&flag, &take_value!("--seed"))?),
             "--tokens" => tokens = Some(parse_token_list(&take_value!("--tokens"))?),
             "--dump-logits" => dump_logits = Some(PathBuf::from(take_value!("--dump-logits"))),
             // A bare "-" is conventionally stdin; nothing here reads it, so it
@@ -162,11 +180,23 @@ fn parse_args(argv: &[String]) -> Result<Action, CliError> {
     }
 
     let model = model.ok_or_else(|| usage_err("missing the model checkpoint path"))?;
+    let sample = SampleConfig {
+        temperature: temp.unwrap_or(0.0),
+        top_p: top_p.unwrap_or(0.9),
+        seed: seed.unwrap_or(0),
+    };
+    if let Err(e) = sample.validate() {
+        return Err(usage_err(e.to_string()));
+    }
+    let has_sampling_flag = temp.is_some() || top_p.is_some() || seed.is_some();
+
     let args = Args {
         model,
         tokenizer,
         input,
         num_tokens: num_tokens.unwrap_or(256),
+        threads: threads.unwrap_or(1),
+        sample,
         tokens,
         dump_logits,
     };
@@ -202,6 +232,11 @@ fn parse_args(argv: &[String]) -> Result<Action, CliError> {
              input sequence to record against",
         ));
     }
+    if has_sampling_flag && args.tokens.is_some() {
+        return Err(usage_err(
+            "--temp, --top-p, and --seed only apply to text generation (-i/--input)",
+        ));
+    }
 
     Ok(Action::Run(Box::new(args)))
 }
@@ -209,6 +244,34 @@ fn parse_args(argv: &[String]) -> Result<Action, CliError> {
 /// Parse a non-negative count, rejecting anything that is not a plain number.
 fn parse_count(flag: &str, s: &str) -> Result<usize, CliError> {
     s.parse::<usize>()
+        .map_err(|_| usage_err(format!("{flag} expects a non-negative integer, got {s:?}")))
+}
+
+/// Parse a positive thread count.
+fn parse_threads(flag: &str, s: &str) -> Result<usize, CliError> {
+    let n = s
+        .parse::<usize>()
+        .map_err(|_| usage_err(format!("{flag} expects a positive integer, got {s:?}")))?;
+    if n == 0 {
+        return Err(usage_err(format!("{flag} must be at least 1, got 0")));
+    }
+    Ok(n)
+}
+
+/// Parse a finite floating-point flag value.
+fn parse_f32(flag: &str, s: &str) -> Result<f32, CliError> {
+    let v = s
+        .parse::<f32>()
+        .map_err(|_| usage_err(format!("{flag} expects a number, got {s:?}")))?;
+    if !v.is_finite() {
+        return Err(usage_err(format!("{flag} must be finite, got {s:?}")));
+    }
+    Ok(v)
+}
+
+/// Parse a 64-bit unsigned integer flag value.
+fn parse_u64(flag: &str, s: &str) -> Result<u64, CliError> {
+    s.parse::<u64>()
         .map_err(|_| usage_err(format!("{flag} expects a non-negative integer, got {s:?}")))
 }
 
@@ -276,6 +339,8 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
         }
         Action::Run(a) => *a,
     };
+
+    ops::set_num_threads(args.threads);
 
     let weights = Weights::load(&args.model)?;
     let cfg = weights.config;
@@ -357,25 +422,52 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
             );
             {
                 let mut out = io::stdout().lock();
-                if !handle_stdout_io(print_tokens(&mut out, &tokenizer, &prompt, None))? {
+                if !handle_stdout_io(
+                    print_tokens(&mut out, &tokenizer, &prompt, None).and_then(|()| out.flush()),
+                )? {
                     return Ok(ExitCode::SUCCESS);
                 }
             }
 
             let start = Instant::now();
-            let generated = model::generate(&weights, &mut state, &prompt, args.num_tokens)?;
+            let mut prev = prompt.last().copied();
+            let mut broken_pipe = false;
+            let mut io_err: Option<io::Error> = None;
+            let generated_count = {
+                let mut out = io::stdout().lock();
+                model::generate_sampled_stream(
+                    &weights,
+                    &mut state,
+                    &prompt,
+                    args.num_tokens,
+                    args.sample,
+                    |token| {
+                        let bytes = tokenizer.decode_one_bytes(prev, token);
+                        prev = Some(token);
+                        match safe_print(&mut out, &bytes).and_then(|()| out.flush()) {
+                            Ok(()) => true,
+                            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                                broken_pipe = true;
+                                false
+                            }
+                            Err(e) => {
+                                io_err = Some(e);
+                                false
+                            }
+                        }
+                    },
+                )?
+            };
             let elapsed = start.elapsed();
 
+            if let Some(e) = io_err {
+                return Err(Box::new(e));
+            }
+            if broken_pipe {
+                return Ok(ExitCode::SUCCESS);
+            }
             {
                 let mut out = io::stdout().lock();
-                if !handle_stdout_io(print_tokens(
-                    &mut out,
-                    &tokenizer,
-                    &generated,
-                    prompt.last().copied(),
-                ))? {
-                    return Ok(ExitCode::SUCCESS);
-                }
                 if !handle_stdout_io(out.write_all(b"\n").and_then(|()| out.flush()))? {
                     return Ok(ExitCode::SUCCESS);
                 }
@@ -386,14 +478,14 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
             // The elapsed time covers every forward pass, including the ones
             // that consumed the prompt, so dividing by generated tokens alone
             // would charge the prompt's cost to nothing and flatter the number.
-            // Counting `prompt.len() + generated.len()` also matches llama2.c's
+            // Counting `prompt.len() + generated_count` also matches llama2.c's
             // convention, which is what makes the two directly comparable in
             // `reference/bench.py`.
-            let processed = prompt.len() + generated.len();
+            let processed = prompt.len() + generated_count;
             let tps = processed as f64 / elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
             eprintln!(
                 "generated {} tokens in {:.3}s ({tps:.2} tok/s, {processed} tokens processed)",
-                generated.len(),
+                generated_count,
                 elapsed.as_secs_f64()
             );
         }
@@ -517,5 +609,54 @@ mod tests {
         let mut w = BrokenPipeWriter;
         let res = safe_print(&mut w, b"hello");
         assert!(!handle_stdout_io(res).unwrap());
+    }
+
+    #[test]
+    fn parse_args_accepts_threads_and_sampling_and_rejects_invalid_combinations() {
+        let argv = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).to_string()).collect() };
+
+        let action = parse_args(&argv(&[
+            "m.bin",
+            "-z",
+            "t.bin",
+            "-i",
+            "hi",
+            "-t",
+            "4",
+            "--temp",
+            "0.8",
+            "--top-p",
+            "0.95",
+            "--seed",
+            "42",
+        ]))
+        .unwrap();
+        match action {
+            Action::Run(a) => {
+                assert_eq!(a.threads, 4);
+                assert_eq!(a.sample.temperature, 0.8);
+                assert_eq!(a.sample.top_p, 0.95);
+                assert_eq!(a.sample.seed, 42);
+            }
+            _ => panic!("expected Action::Run"),
+        }
+
+        // Zero threads is rejected.
+        assert!(parse_args(&argv(&["m.bin", "-z", "t.bin", "-i", "hi", "-t", "0"])).is_err());
+        // Negative temperature and out-of-range top-p are rejected.
+        assert!(parse_args(&argv(&[
+            "m.bin", "-z", "t.bin", "-i", "hi", "--temp", "-0.1"
+        ]))
+        .is_err());
+        assert!(parse_args(&argv(&[
+            "m.bin", "-z", "t.bin", "-i", "hi", "--top-p", "0.0"
+        ]))
+        .is_err());
+        assert!(parse_args(&argv(&[
+            "m.bin", "-z", "t.bin", "-i", "hi", "--top-p", "1.5"
+        ]))
+        .is_err());
+        // Sampling flags cannot be combined with --tokens.
+        assert!(parse_args(&argv(&["m.bin", "--tokens", "1,2", "--temp", "0.5"])).is_err());
     }
 }

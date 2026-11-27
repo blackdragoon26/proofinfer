@@ -16,8 +16,8 @@ proofinfer/
   CONTEXT.md                 design notes: format, forward pass, gotchas, TCB
   src/
     lib.rs                   module map
-    ops.rs                   kernels: rmsnorm, softmax, silu, matmul, RoPE, GQA
-    model.rs                 config, hardened checkpoint loader, State, forward, generate
+    ops.rs                   kernels: rmsnorm, softmax, silu, matmul (with optional std::thread::scope parallelism), RoPE, GQA
+    model.rs                 config, hardened checkpoint loader, State, forward, streaming/sampled generate
     tokenizer.rs             BPE vocabulary reader, encoder, decoder
     main.rs                  CLI
   tests/
@@ -73,11 +73,16 @@ in place, so the memory footprint of decoding is a sum you can write down:
 scratch is a handful of vectors, and the cache dominates at
 `2 * n_layers * seq_len * kv_dim`.
 
-**Greedy only, no sampling.** Sampling needs an RNG, and an RNG would make the
-byte-identical comparison against `run.c` impossible unless both sides
-consumed the identical stream. Greedy decoding is a pure function of the weights
-and the prompt, so two implementations that agree on the maths produce
-byte-identical output — a far stronger claim than "the samples look similar".
+**Greedy by default, with optional deterministic sampling and threading.**
+Default decoding (`--temp 0.0`, `--threads 1`) is strictly greedy argmax: a pure
+function of the weights and the prompt, so two implementations that agree on the
+maths produce byte-identical output against `run.c`. When interactive variety or
+multi-core throughput is wanted, `--temp`, `--top-p`, and `--seed` enable
+deterministic nucleus sampling backed by `xorshift64*` (matching `llama2.c`'s
+`random_u32`), and `-t/--threads` partitions `matmul` output rows across
+`std::thread::scope` workers with zero external crates and bit-for-bit identical
+arithmetic. Generated tokens stream to stdout as each step finishes rather than
+buffering until completion.
 
 **Bugs found by the byte-identity check that no unit test caught.** Generation
 originally stopped on EOS; llama2.c stops on BOS, which is the document
@@ -190,13 +195,10 @@ That run is also what justified the ANSI-colour fix in the toolchain-discovery
 step: on Linux the parse still had to strip the escape sequence to recover
 `1.98.1-x86_64-unknown-linux-gnu` from the same coloured error message.
 
-**What is still unexecuted, precisely:** the GitHub-hosted actions themselves —
-`actions/checkout`, `actions/cache`, `actions/setup-python` and
-`dtolnay/rust-toolchain`. Those are standard, they are not written here, and the
-container provided its own `curl`/`unzip`/`python3`/`rustup` in their place. The
-remaining risk on a first CI run is therefore in the YAML and the runner
-environment, not in the commands this repository contributes. If the `proof` job
-does go red, the other three jobs are unaffected and the log will name the step.
+All six GitHub Actions CI jobs (`rust`, `msrv`, `site-and-provenance`,
+`differential`, `real-weights`, and `proof`) run on GitHub-hosted
+`ubuntu-latest` runners on every push and pull request, with no `|| true` and no
+`continue-on-error`.
 
 Nothing else here is machine-checked. The loader's totality rests on 2000 fuzz
 iterations plus reasoning, not a proof; the differential test establishes
@@ -208,9 +210,10 @@ half-done: a differential test against **vLLM** (needs a GPU and a Hugging Face
 export path, and the harness is written so that adding a third oracle is a new
 config table rather than a new file), and **Triton** kernels for rmsnorm,
 softmax and matmul (a benchmarking exercise with no bearing on whether the
-engine is correct, which is the claim this repository makes). The measurement
-in this repository is CPU and single-threaded throughout; nothing here says
-anything about GPU inference.
+engine is correct, which is the claim this repository makes). The benchmark
+measurements in this repository are CPU and single-threaded by default (with
+optional multi-threaded matmul via `--threads`); nothing here says anything
+about GPU inference.
 
 ### Credits
 

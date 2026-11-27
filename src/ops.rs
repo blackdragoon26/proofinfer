@@ -10,6 +10,8 @@
 //! argument. Where an operation is elementwise and destructive, it takes a
 //! single `&mut [f32]` and transforms it in place.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 /// Epsilon added to the mean square before the square root in [`rmsnorm`].
 ///
 /// This is *not* a numerical-stability fudge in the usual sense: it is the
@@ -194,6 +196,12 @@ pub fn softmax(x: &mut [f32]) {
             max = *v;
         }
     }
+    if max == f32::NEG_INFINITY && x.iter().all(|&v| v == f32::NEG_INFINITY) {
+        // Subtracting -inf from -inf would yield NaN. If every input is -inf
+        // (and none are NaN), fall back to a uniform distribution.
+        x.fill(1.0 / x.len() as f32);
+        return;
+    }
     shift_in_place(x, max);
 
     let mut sum = 0.0f32;
@@ -225,6 +233,55 @@ pub fn silu_value(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+static MATMUL_THREADS: AtomicUsize = AtomicUsize::new(1);
+
+/// Configure the number of worker threads used by [`matmul`].
+///
+/// `0` is clamped to `1`. The default is `1` (single-threaded), keeping
+/// single-threaded execution untouched. Multi-threaded execution partitions
+/// output rows across `std::thread::scope` workers so each output element
+/// executes the exact same [`dot`] reduction and remains bit-for-bit identical
+/// to single-threaded execution.
+pub fn set_num_threads(threads: usize) {
+    MATMUL_THREADS.store(threads.max(1), Ordering::Relaxed);
+}
+
+/// Return the configured worker thread count for [`matmul`].
+pub fn num_threads() -> usize {
+    MATMUL_THREADS.load(Ordering::Relaxed)
+}
+
+/// `out = W @ x` parallelised across output rows using `std::thread::scope`.
+///
+/// Each worker computes the exact same [`dot`] per row as single-threaded
+/// [`matmul`], so the output is bit-for-bit identical regardless of `threads`.
+/// Small matrices fall back to the inline loop to avoid thread-spawn overhead.
+pub fn matmul_parallel(o: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize, threads: usize) {
+    debug_assert_eq!(o.len(), n);
+    debug_assert_eq!(x.len(), d);
+    debug_assert_eq!(w.len(), n * d);
+
+    let workers = threads.max(1).min(n);
+    if workers <= 1 || n < 32 || d == 0 {
+        for i in 0..n {
+            let row = &w[i * d..i * d + d];
+            o[i] = dot(row, x);
+        }
+        return;
+    }
+
+    let chunk_rows = n / workers + usize::from(n % workers != 0);
+    std::thread::scope(|s| {
+        for (o_chunk, w_chunk) in o.chunks_mut(chunk_rows).zip(w.chunks(chunk_rows * d)) {
+            s.spawn(move || {
+                for (slot, row) in o_chunk.iter_mut().zip(w_chunk.chunks_exact(d)) {
+                    *slot = dot(row, x);
+                }
+            });
+        }
+    });
+}
+
 /// `out = W @ x` where `W` is `n x d` stored row-major and `x` has length `d`.
 ///
 /// Written as `out[i] = dot(W[i], x)`: each output element contracts a row of
@@ -236,6 +293,12 @@ pub fn matmul(o: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
     debug_assert_eq!(o.len(), n);
     debug_assert_eq!(x.len(), d);
     debug_assert_eq!(w.len(), n * d);
+
+    let threads = num_threads();
+    if threads > 1 {
+        matmul_parallel(o, x, w, n, d, threads);
+        return;
+    }
 
     for i in 0..n {
         let row = &w[i * d..i * d + d];
@@ -966,5 +1029,42 @@ mod tests {
         assert_eq!((d.kv_dim(), d.kv_mul(), d.q_dim()), (24, 4, 96));
         let d = AttentionDims::try_new(64, 4, 1).unwrap(); // "mqa"
         assert_eq!((d.kv_dim(), d.kv_mul(), d.q_dim()), (16, 4, 64));
+    }
+
+    #[test]
+    fn softmax_all_neg_infinity_stays_finite_and_preserves_nan() {
+        let mut x = [f32::NEG_INFINITY; 4];
+        softmax(&mut x);
+        assert!(x.iter().all(|v| v.is_finite()), "got {x:?}");
+        for &v in &x {
+            assert_close(v, 0.25, 1e-6);
+        }
+
+        // NaN inputs must remain NaN rather than being masked as uniform.
+        let mut nan_row = [f32::NAN, f32::NAN];
+        softmax(&mut nan_row);
+        assert!(nan_row.iter().all(|v| v.is_nan()), "got {nan_row:?}");
+    }
+
+    #[test]
+    fn matmul_parallel_is_bit_identical_to_single_threaded() {
+        for &(n, d) in &[(17, 13), (32, 8), (97, 29), (257, 64)] {
+            let x: Vec<f32> = (0..d).map(|i| (i as f32 * 0.37).sin()).collect();
+            let w: Vec<f32> = (0..n * d).map(|i| (i as f32 * 0.13).cos()).collect();
+            let mut single = vec![0.0f32; n];
+            matmul_parallel(&mut single, &x, &w, n, d, 1);
+
+            for threads in [2usize, 3, 4, 8] {
+                let mut parallel = vec![0.0f32; n];
+                matmul_parallel(&mut parallel, &x, &w, n, d, threads);
+                for i in 0..n {
+                    assert_eq!(
+                        parallel[i].to_bits(),
+                        single[i].to_bits(),
+                        "mismatch at row {i} for ({n}x{d}) with {threads} threads"
+                    );
+                }
+            }
+        }
     }
 }
