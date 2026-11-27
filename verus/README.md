@@ -1,11 +1,12 @@
-# KV-cache and weight-slice index safety in Verus
+# KV-cache, weight-slice, and Q8_0 index safety in Verus
 
 This directory holds a machine-checked proof of the property named in
 CONTEXT.md section 10, question 7: **KV-cache and attention indexing never goes
 out of bounds for any `pos < seq_len`**, extended to cover `State::new`'s
-checked cache-length arithmetic and parametric `Weights::layer` slicing.
+checked cache-length arithmetic, parametric `Weights::layer` slicing, and Q8_0
+quantized block and scale indexing (`dot_q80` and `matmul_q80`).
 
-- [kv_cache_bounds.rs](kv_cache_bounds.rs) — the Verus development. **36
+- [kv_cache_bounds.rs](kv_cache_bounds.rs) — the Verus development. **46
   verification conditions, all discharged by Verus under `--no-cheating`.** See
   "Verification status" below for the exact command and its real output.
 - [check_citations.py](check_citations.py) — bidirectional, symbol-scoped
@@ -87,6 +88,16 @@ For any per-layer weight tensor of length `n_layers * per_layer` and any layer
 overflow-free, and in bounds. This covers all nine per-layer weight accessors
 (`rms_att`, `rms_ffn`, `wq`, `wk`, `wv`, `wo`, `w1`, `w2`, `w3`) uniformly.
 
+**Claim 7 — Q8_0 quantized block and scale indexing**
+(`lemma_q80_groups_tile_dim`, `lemma_q80_group_slice_in_row`,
+`lemma_q80_row_and_scale_in_matrix`, `exec_q80_dot_bounds`, and
+`exec_q80_matmul_bounds`).
+For any `d > 0`, `group_size > 0` with `d % group_size == 0`, every `i8` block
+slice `&w.q[start..end]` and `&x.q[start..end]` and every per-group scale access
+`w.s[g]` / `x.s[g]` in `ops.rs::dot_q80` is non-empty, overflow-free, and in
+bounds; and `exec_q80_matmul_bounds` composes the row/scale slicing in
+`ops.rs::matmul_q80` directly into `exec_q80_dot_bounds`.
+
 ## 2. Where each claim lands in the Rust source
 
 Citations are symbol-scoped rather than line-numbered and are verified
@@ -111,6 +122,8 @@ bidirectionally against both `src/` and `verus/kv_cache_bounds.rs` by
 | `model.rs::State::forward` | `let base = l*stride + pos*kv_dim; key_cache/value_cache[base..base+kv_dim]` | `lemma_cache_write_in_cache`, `exec_forward_cache_write_and_layer_slice` |
 | `model.rs::State::forward` | `layer_start`/`layer_end`, `&self.key_cache[layer_start..layer_end]` / `&self.value_cache[layer_start..layer_end]` passed to `attention` | `lemma_layer_slice_in_cache`, `exec_forward_cache_write_and_layer_slice` calling `exec_attention_read` |
 | `model.rs::State::forward` | `if pos >= cfg.seq_len { return Err(..) }` | the `pos < seq_len` hypothesis everywhere |
+| `ops.rs::dot_q80` | `let n_groups = d / group_size; &w.q[start..end], &x.q[start..end], w.s[g], x.s[g]` | `lemma_q80_group_slice_in_row`, `exec_q80_dot_bounds` |
+| `ops.rs::matmul_q80` | `&w.q[i*d..i*d+d]`, `&w.s[i*row_groups..i*row_groups+row_groups]` | `lemma_q80_row_and_scale_in_matrix`, `exec_q80_matmul_bounds` calling `exec_q80_dot_bounds` |
 
 Section 7 of `kv_cache_bounds.rs` contains executable `exec fn`s with the index
 expressions **copied verbatim** from the table above, operating on real
@@ -269,7 +282,7 @@ Verus
   Toolchain: 1.98.1-x86_64-unknown-linux-gnu
 
 $ verus --crate-type lib --no-cheating verus/kv_cache_bounds.rs
-verification results:: 36 verified, 0 errors
+verification results:: 46 verified, 0 errors
 $ echo $?
 0
 ```
@@ -280,20 +293,21 @@ $ echo $?
   `3f89fd250d1e9792ed6d0c7c3ad72c03c02fdbca3f0638987af6e153d69377bc`).
 - rustc `1.98.1`, installed into an isolated `RUSTUP_HOME`. No `vargo`, no
   `cargo install`, nothing added to `Cargo.toml` or `Cargo.lock`.
-- Wall clock for the verification itself: ~3.9 s on x86_64 Linux.
-- `verus/check_citations.py --self-test` (9/9 mutations rejected) and
-  `verus/check_citations.py` (11 symbol-scoped bidirectional citations) both
+- Wall clock for the verification itself: ~4 s on x86_64 Linux.
+- `verus/check_citations.py --self-test` (11/11 mutations rejected) and
+  `verus/check_citations.py` (13 symbol-scoped bidirectional citations) both
   pass across `src/` and `verus/kv_cache_bounds.rs`.
 - `grep` finds no `assume`, `admit`, or `external_body` in the file, and
   `--no-cheating` passes, which is the stronger of the two claims.
 
-**What "verified" means here, and what it does not.** 36 verification
-conditions passed, covering the six claims in section 1. That is a proof about
+**What "verified" means here, and what it does not.** 46 verification
+conditions passed, covering the seven claims in section 1. That is a proof about
 the model in `kv_cache_bounds.rs` and about the real slice expressions
-transcribed into its section 7. It is not a proof about the compiled
+transcribed into its sections 7 and 8. It is not a proof about the compiled
 `src/ops.rs` or `src/model.rs`, and section 3 lists what that excludes. The
-honest one-line summary: **the indexing arithmetic, checked cache-size guard,
-`forward -> attention` slice composition, and `Weights::layer` bounds are
-machine-checked by Verus, and `verus/check_citations.py` checks that every
-cited `src/` and `exec_*` expression still matches textually; semantic
-equivalence across un-cited code remains a manual correspondence.**
+honest one-line summary: **the KV-cache indexing arithmetic, checked cache-size
+guard, `forward -> attention` slice composition, `Weights::layer` bounds, and
+Q8_0 `matmul_q80 -> dot_q80` block/scale bounds are machine-checked by Verus,
+and `verus/check_citations.py` checks that every cited `src/` and `exec_*`
+expression still matches textually; semantic equivalence across un-cited code
+remains a manual correspondence.**

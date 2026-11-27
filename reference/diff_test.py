@@ -55,7 +55,7 @@ sys.path.insert(0, str(LLAMA2C))
 
 # The vendored reference is imported by path. Its `tokenizer.py` needs
 # sentencepiece, which this harness never uses, so it is never imported.
-from export import legacy_export, load_checkpoint  # noqa: E402
+from export import legacy_export, load_checkpoint, quantize_q80, version2_export  # noqa: E402
 from model import ModelArgs, Transformer  # noqa: E402
 
 # Absolute + relative tolerance on every logit.
@@ -135,9 +135,26 @@ class Result:
     n_positions: int
     worst: Optional[str] = None
     top1_mismatches: int = 0
+    q80_mode: bool = False
+    pos0_max_err: float = 0.0
+    min_cosine: float = 1.0
 
     @property
     def ok(self) -> bool:
+        if self.q80_mode:
+            # Dynamic INT8 activation quantization uses round(), which is
+            # discontinuous at half-integers: a 1-ULP upstream difference
+            # between batched PyTorch SDPA and token-by-token KV attention can
+            # flip one quantized activation by +/-1 and propagate through the
+            # causal KV cache on later positions. Checking pos0_max_err <= 1e-4
+            # pins exact Q8_0 weight/scale/embedding/classifier arithmetic to
+            # ~1e-6, while min_cosine >= 0.999 and >= 95% top-1 guard every
+            # position across the full causal context.
+            return (
+                self.pos0_max_err <= ABS_TOL
+                and self.min_cosine >= 0.999
+                and (self.top1_agreed / max(self.n_positions, 1)) >= 0.95
+            )
         return self.max_rel_to_tol <= 1.0 and self.top1_mismatches == 0
 
 
@@ -251,7 +268,7 @@ def run_engine(binary: Path, checkpoint: Path, tokens: list[int], dump: Path) ->
     return raw.reshape(n, raw.size // n)
 
 
-def compare(name: str, ref: np.ndarray, got: np.ndarray) -> Result:
+def compare(name: str, ref: np.ndarray, got: np.ndarray, *, q80_mode: bool = False) -> Result:
     """Compare two `(n, vocab)` logit matrices under the stated tolerance."""
     if ref.shape != got.shape:
         raise RuntimeError(f"{name}: shape mismatch {ref.shape} vs {got.shape}")
@@ -267,6 +284,14 @@ def compare(name: str, ref: np.ndarray, got: np.ndarray) -> Result:
     ref_top1 = ref.argmax(axis=-1)
     got_top1 = got.argmax(axis=-1)
     mismatches = int((ref_top1 != got_top1).sum())
+
+    per_pos_max = err.max(axis=-1)
+    pos0_max_err = float(per_pos_max[0])
+    ref_norm = np.linalg.norm(ref, axis=-1)
+    got_norm = np.linalg.norm(got, axis=-1)
+    denom = np.maximum(ref_norm * got_norm, 1e-12)
+    cosines = (ref * got).sum(axis=-1) / denom
+    min_cosine = float(cosines.min())
 
     worst = None
     if np.isfinite(ratio).any() and ratio.max() > 1.0:
@@ -287,7 +312,118 @@ def compare(name: str, ref: np.ndarray, got: np.ndarray) -> Result:
         n_positions=ref.shape[0],
         worst=worst,
         top1_mismatches=mismatches,
+        q80_mode=q80_mode,
+        pos0_max_err=pos0_max_err,
+        min_cosine=min_cosine,
     )
+
+
+def q80_sim_linear(x: torch.Tensor, w: torch.Tensor, group_size: int) -> torch.Tensor:
+    """Independent PyTorch reference matching Q8_0 weight + dynamic activation quantization."""
+    # Quantize-dequantize weights using vendored `quantize_q80`.
+    wq, ws, _ = quantize_q80(w, group_size)
+    w_deq = (wq.float() * ws[:, None]).reshape(w.shape)
+
+    # Dynamic per-group symmetric Q8_0 activation quantization on each row of x,
+    # using round-half-away-from-zero to match Rust `f32::round` and C `roundf`.
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, group_size).float()
+    wmax = torch.abs(x_2d).max(dim=1).values
+    xs = wmax / 127.0
+    safe_s = torch.where(xs == 0, torch.ones_like(xs), xs)
+    scaled = x_2d / safe_s[:, None]
+    xq = (torch.sign(scaled) * torch.floor(torch.abs(scaled) + 0.5)).clamp(-127.0, 127.0).to(torch.int8)
+    x_deq = torch.where(
+        xs[:, None] == 0,
+        torch.zeros_like(xq.float()),
+        xq.float() * xs[:, None],
+    ).reshape(orig_shape)
+    return torch.nn.functional.linear(x_deq, w_deq)
+
+
+def q80_reference_logits(model: Transformer, tokens: torch.Tensor, group_size: int) -> np.ndarray:
+    """Independent PyTorch forward pass over a Q8_0-quantized Transformer."""
+    with torch.no_grad():
+        tok_q, tok_s, _ = quantize_q80(model.tok_embeddings.weight, group_size)
+        tok_emb = (tok_q.float() * tok_s[:, None]).reshape(model.tok_embeddings.weight.shape)
+        h = torch.nn.functional.embedding(tokens, tok_emb)
+        bsz, seqlen, dim = h.shape
+        freqs_cos = model.freqs_cos[:seqlen]
+        freqs_sin = model.freqs_sin[:seqlen]
+
+        def apply_rope(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            q_r, q_i = q.float().reshape(q.shape[:-1] + (-1, 2)).unbind(-1)
+            k_r, k_i = k.float().reshape(k.shape[:-1] + (-1, 2)).unbind(-1)
+            fc = freqs_cos.view(1, seqlen, 1, -1)
+            fs = freqs_sin.view(1, seqlen, 1, -1)
+            qo_r = q_r * fc - q_i * fs
+            qo_i = q_r * fs + q_i * fc
+            ko_r = k_r * fc - k_i * fs
+            ko_i = k_r * fs + k_i * fc
+            return (
+                torch.stack([qo_r, qo_i], dim=-1).flatten(3),
+                torch.stack([ko_r, ko_i], dim=-1).flatten(3),
+            )
+
+        for layer in model.layers:
+            xn = layer.attention_norm(h)
+            att = layer.attention
+            xq = q80_sim_linear(xn, att.wq.weight, group_size).view(
+                bsz, seqlen, att.n_local_heads, att.head_dim
+            )
+            xk = q80_sim_linear(xn, att.wk.weight, group_size).view(
+                bsz, seqlen, att.n_local_kv_heads, att.head_dim
+            )
+            xv = q80_sim_linear(xn, att.wv.weight, group_size).view(
+                bsz, seqlen, att.n_local_kv_heads, att.head_dim
+            )
+            xq, xk = apply_rope(xq, xk)
+            if att.n_rep > 1:
+                xk = torch.repeat_interleave(xk, dim=2, repeats=att.n_rep)
+                xv = torch.repeat_interleave(xv, dim=2, repeats=att.n_rep)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                xq.transpose(1, 2),
+                xk.transpose(1, 2),
+                xv.transpose(1, 2),
+                is_causal=True,
+            ).transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+            h = h + q80_sim_linear(out, att.wo.weight, group_size)
+
+            fn = layer.ffn_norm(h)
+            ff = layer.feed_forward
+            gate = torch.nn.functional.silu(q80_sim_linear(fn, ff.w1.weight, group_size))
+            up = q80_sim_linear(fn, ff.w3.weight, group_size)
+            h = h + q80_sim_linear(gate * up, ff.w2.weight, group_size)
+
+        h = model.norm(h)
+        logits = q80_sim_linear(h, model.output.weight, group_size)
+        return logits[0].to(torch.float32).numpy()
+
+
+def run_random_q80_config(cfg: Config, binary: Path, seed: int) -> Result:
+    """Differential test for a `version2_export` Q8_0 quantized checkpoint."""
+    model = build_reference(cfg, seed)
+    group_size = 64
+    while cfg.dim % group_size != 0:
+        group_size //= 2
+
+    with tempfile.TemporaryDirectory() as tmp:
+        checkpoint = Path(tmp) / f"{cfg.name}_q80.bin"
+        logits_path = Path(tmp) / f"{cfg.name}_q80.f32"
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            version2_export(model, str(checkpoint), group_size=group_size)
+
+        gen = torch.Generator().manual_seed(seed + 2)
+        tokens = torch.randint(
+            0, cfg.vocab_size, (1, cfg.seq_len), generator=gen, dtype=torch.long
+        )
+
+        ref = q80_reference_logits(model, tokens, group_size)
+        ids = [int(t) for t in tokens[0].tolist()]
+        got = run_engine(binary, checkpoint, ids, logits_path)
+
+    return compare(f"{cfg.name}:q80", ref, got, q80_mode=True)
 
 
 def run_random_config(cfg: Config, binary: Path, seed: int) -> Result:
@@ -407,6 +543,24 @@ def run_real_checkpoint(
 
 def report(results: list[Result]) -> None:
     print()
+    if results and all(r.q80_mode for r in results):
+        print(
+            f"{'config':<18}{'pos0|err|':>12}{'max|err|':>12}{'min_cos':>11}"
+            f"{'top-1':>12}{'result':>9}"
+        )
+        print("-" * 74)
+        for r in results:
+            top1 = f"{r.top1_agreed}/{r.n_positions}"
+            status = "PASS" if r.ok else "FAIL"
+            print(
+                f"{r.name:<18}{r.pos0_max_err:>12.3e}{r.max_abs_err:>12.3e}"
+                f"{r.min_cosine:>11.6f}{top1:>12}{status:>9}"
+            )
+            if not r.ok and r.worst:
+                print(f"{'':<18}  worst: {r.worst}")
+        print()
+        return
+
     print(
         f"{'config':<16}{'max|err|':>12}{'max|ref|':>12}{'err/tol':>10}"
         f"{'top-1':>12}{'result':>9}"
@@ -459,6 +613,11 @@ def main() -> int:
         type=Path,
         help="with --checkpoint, also save the exported legacy .bin checkpoint at this path",
     )
+    parser.add_argument(
+        "--q80",
+        action="store_true",
+        help="export and differentially test version 2 Q8_0 quantized checkpoints",
+    )
     args = parser.parse_args()
 
     binary = args.binary.resolve()
@@ -499,11 +658,14 @@ def main() -> int:
                     return 2
                 selected = tuple(c for c in CONFIGS if c.name in wanted)
 
-            print("random-weight mode")
+            print("random-weight mode (Q8_0 v2)" if args.q80 else "random-weight mode")
             results = []
             for cfg in selected:
                 print(f"  {cfg.name:<14} {cfg.describe()}", flush=True)
-                r = run_random_config(cfg, binary, args.seed)
+                if args.q80:
+                    r = run_random_q80_config(cfg, binary, args.seed)
+                else:
+                    r = run_random_config(cfg, binary, args.seed)
                 print(
                     f"  {'':<14} max|err|={r.max_abs_err:.3e} "
                     f"max|ref|={r.max_abs_ref:.3f} err/tol={r.max_rel_to_tol:.3f} "

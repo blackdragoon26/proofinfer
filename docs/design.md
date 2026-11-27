@@ -16,26 +16,29 @@ proofinfer/
   CONTEXT.md                 design notes: format, forward pass, gotchas, TCB
   src/
     lib.rs                   module map
-    ops.rs                   kernels: rmsnorm, softmax, silu, matmul (with optional std::thread::scope parallelism), RoPE, GQA
-    model.rs                 config, hardened checkpoint loader, State, forward, streaming/sampled generate
+    ops.rs                   kernels: rmsnorm, softmax, silu, matmul, Q8_0 quant/dot/matmul, RoPE, GQA
+    model.rs                 config, hardened FP32 loader, State, forward, streaming/sampled generate
+    quant.rs                 version 2 Q8_0 checkpoint loader, QuantizedState, auto-detected Checkpoint
+    pool.rs                  zero-dependency persistent scoped worker pool for FP32 and Q8_0 matmul
     tokenizer.rs             BPE vocabulary reader, encoder, decoder
     main.rs                  CLI
   tests/
     engine.rs                forward/generation properties
     loader.rs                hostile-input totality
+    quant.rs                 Q8_0 v2 loader totality, causality, persistent pool bit-identity
     tokenizer.rs             conformance to Meta's token vectors
   reference/
-    diff_test.py             differential harness vs PyTorch
+    diff_test.py             differential harness vs PyTorch (FP32 and Q8_0 v2)
     mutation_check.py        proves the differential harness can fail
     mutation_check_tests.py  proves the Rust test suite can fail
     bench.py                 benchmark + byte-identity check
     check_provenance.py      verifies vendored llama2c sha256s + byte sizes
     requirements.txt         pinned CPU PyTorch/numpy CI dependencies
     llama2c/                 vendored UNMODIFIED from karpathy/llama2.c (MIT)
-  verus/                     Verus proof of KV-cache and weight-layer index
-                             safety (36 conditions, machine-checked; rendered
+  verus/                     Verus proof of KV-cache, weight-layer, and Q8_0 block/scale
+                             index safety (46 conditions, machine-checked; rendered
                              to site/proof.html; see its README for the scope)
-                             plus check_citations.py, which checks symbol-scoped
+                             plus check_citations.py, which checks 13 symbol-scoped
                              expressions across both src/ and verus/
   .github/workflows/ci.yml   six jobs, no `|| true`, no continue-on-error
 ```
@@ -73,16 +76,23 @@ in place, so the memory footprint of decoding is a sum you can write down:
 scratch is a handful of vectors, and the cache dominates at
 `2 * n_layers * seq_len * kv_dim`.
 
-**Greedy by default, with optional deterministic sampling and threading.**
+**Greedy by default, with optional deterministic sampling, Q8_0, and persistent threading.**
 Default decoding (`--temp 0.0`, `--threads 1`) is strictly greedy argmax: a pure
 function of the weights and the prompt, so two implementations that agree on the
-maths produce byte-identical output against `run.c`. When interactive variety or
-multi-core throughput is wanted, `--temp`, `--top-p`, and `--seed` enable
-deterministic nucleus sampling backed by `xorshift64*` (matching `llama2.c`'s
-`random_u32`), and `-t/--threads` partitions `matmul` output rows across
-`std::thread::scope` workers with zero external crates and bit-for-bit identical
-arithmetic. Generated tokens stream to stdout as each step finishes rather than
-buffering until completion.
+maths produce byte-identical output against `run.c`. When interactive variety,
+smaller checkpoints, or multi-core execution is wanted:
+
+- `--temp`, `--top-p`, and `--seed` enable deterministic nucleus sampling backed
+  by `xorshift64*` (matching `llama2.c`'s `random_u32`).
+- `src/quant.rs` auto-detects `llama2.c` version 2 `Q8_0` checkpoints (cutting
+  `stories15M` from 58 MB to 17 MB) with allocation-free dynamic activation
+  quantization and an 8-lane `i8 x i8 -> i32` dot product.
+- `-t/--threads` runs a zero-dependency persistent worker pool (`src/pool.rs`,
+  built on `std::thread::scope` and spin-then-park `Condvar` synchronization
+  with zero `unsafe`) spawned once per session so workers are reused across all
+  layers and tokens, staying bit-for-bit identical to single-threaded execution.
+- Generated tokens stream to stdout as each step finishes rather than buffering
+  until completion.
 
 **Bugs found by the byte-identity check that no unit test caught.** Generation
 originally stopped on EOS; llama2.c stops on BOS, which is the document
@@ -109,7 +119,7 @@ index computed in `ops::attention` and `State::forward` is in bounds.
 
 `verus/` contains a Verus development for exactly that, and it is
 **machine-checked**: Verus `0.2026.09.20.aef82ed` reports
-`36 verified, 0 errors` under `--no-cheating`, which rejects `assume`, `admit`
+`46 verified, 0 errors` under `--no-cheating`, which rejects `assume`, `admit`
 and `external_body` outright. That is a real run, not a claim. The full proof
 write-up is rendered directly from `verus/README.md` to `site/proof.html`.
 
@@ -121,10 +131,12 @@ the loader actually performs; that `State::new`'s `checked_mul` and
 composed `forward -> attention` layer-slice handoff satisfies `attention`'s
 preconditions; that `Weights::layer` is in bounds and overflow-free across all
 per-layer weight tensors; that the GQA mapping `h / kv_mul` lands in
-`0..n_kv_heads`; and that the index arithmetic cannot overflow `usize`. The
-real slice expressions are transcribed into `exec fn`s operating on actual
-`&Vec<f32>` and `&[f32]` slices, so Verus discharges genuine slice-indexing
-obligations rather than assertions about symbolic expressions.
+`0..n_kv_heads`; that Q8_0 quantized block and per-group scale slicing in
+`ops::matmul_q80` and `ops::dot_q80` is in bounds and overflow-free; and that
+the index arithmetic cannot overflow `usize`. The real slice expressions are
+transcribed into `exec fn`s operating on actual `&Vec<f32>`, `&[f32]`, and
+`&[i8]` slices, so Verus discharges genuine slice-indexing obligations rather
+than assertions about symbolic expressions.
 
 #### Keeping the proof honest
 
@@ -187,8 +199,8 @@ Found Verus at verus-dist/verus-x86-linux/verus
 verus: required rust toolchain 1.98.1-x86_64-unknown-linux-gnu not found
   rustup install 1.98.1-x86_64-unknown-linux-gnu
 Verus requires: 1.98.1-x86_64-unknown-linux-gnu
---- 5. Verify the KV-cache index-safety proof ---
-verification results:: 36 verified, 0 errors
+--- 5. Verify the KV-cache, weight-layer, and Q8_0 index-safety proof ---
+verification results:: 46 verified, 0 errors
 ```
 
 That run is also what justified the ANSI-colour fix in the toolchain-discovery

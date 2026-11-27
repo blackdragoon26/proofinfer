@@ -113,6 +113,47 @@ REGISTRY: dict[str, Check] = {
             "&value_cache[t * kv_dim + kv * head_size..t * kv_dim + (kv + 1) * head_size]",
         ),
     ),
+    "ops.rs::dot_q80": Check(
+        src_file="ops.rs",
+        symbol="dot_q80",
+        src_exprs=(
+            "debug_assert!(group_size > 0);",
+            "debug_assert_eq!(d % group_size, 0);",
+            "let n_groups = d / group_size;",
+            "let start = g * group_size;",
+            "let end = start + group_size;",
+            "&w.q[start..end]",
+            "&x.q[start..end]",
+            "w.s[g]",
+            "x.s[g]",
+        ),
+        verus_fn="exec_q80_dot_bounds",
+        verus_exprs=(
+            "let n_groups = d / group_size;",
+            "let start = g * group_size;",
+            "let end = start + group_size;",
+            "&wq[start..end]",
+            "&xq[start..end]",
+            "ws[g]",
+            "xs[g]",
+        ),
+    ),
+    "ops.rs::matmul_q80": Check(
+        src_file="ops.rs",
+        symbol="matmul_q80",
+        src_exprs=(
+            "let row_groups = d / group_size;",
+            "&w.q[i * d..i * d + d]",
+            "&w.s[i * row_groups..i * row_groups + row_groups]",
+        ),
+        verus_fn="exec_q80_matmul_bounds",
+        verus_exprs=(
+            "let row_groups = d / group_size;",
+            "&wq[i * d..i * d + d]",
+            "&ws[i * row_groups..i * row_groups + row_groups]",
+            "exec_q80_dot_bounds(q_row, s_row, xq, xs, d, group_size);",
+        ),
+    ),
     # --- src/model.rs -------------------------------------------------------
     "model.rs::Config::validate": Check(
         src_file="model.rs",
@@ -756,6 +797,31 @@ def run_self_test(
                 "exec_weight_layer_slice",
                 "&buf[start..start + per_layer]",
                 "&buf[0..per_layer]",
+            ),
+        ),
+        (
+            "src-q80-scale-row-mutated",
+            "ops.rs::matmul_q80",
+            {
+                **sources,
+                "ops.rs": mutate_token_span(
+                    sources["ops.rs"],
+                    "matmul_q80",
+                    "&w.s[i * row_groups..i * row_groups + row_groups]",
+                    "&w.s[0..row_groups]",
+                ),
+            },
+            verus_source,
+        ),
+        (
+            "verus-q80-dot-slice-mutated",
+            "ops.rs::dot_q80",
+            sources,
+            mutate_token_span(
+                verus_source,
+                "exec_q80_dot_bounds",
+                "&wq[start..end]",
+                "&wq[0..group_size]",
             ),
         ),
     ]

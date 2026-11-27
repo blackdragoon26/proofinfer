@@ -133,7 +133,7 @@ impl Config {
     /// Note that `AttentionDims::try_new` is reused for the head geometry rules
     /// rather than reimplemented, so the loader and the attention kernel cannot
     /// drift apart on what a legal model is.
-    fn validate(&self) -> Result<AttentionDims, LoadError> {
+    pub(crate) fn validate(&self) -> Result<AttentionDims, LoadError> {
         if self.dim == 0 {
             return Err(LoadError::InvalidHeader("dim must be positive".into()));
         }
@@ -259,7 +259,7 @@ impl<'a> Reader<'a> {
 /// This is the only place tensor element counts are computed, so the overflow
 /// rule is stated once. The `what` label names the tensor for the error message
 /// because "size overflow" without a tensor name is not actionable.
-fn checked_tensor_len(what: &'static str, dims: &[usize]) -> Result<usize, LoadError> {
+pub(crate) fn checked_tensor_len(what: &'static str, dims: &[usize]) -> Result<usize, LoadError> {
     dims.iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
         .ok_or(LoadError::Overflow { what })
@@ -576,7 +576,7 @@ impl Weights {
 /// Allocate a zero-initialised `Vec<f32>` fallibly so both `isize::MAX` byte
 /// capacity overflows and host out-of-memory errors become `LoadError::Overflow`
 /// instead of aborting the process.
-fn try_zeroed_f32_vec(what: &'static str, len: usize) -> Result<Vec<f32>, LoadError> {
+pub(crate) fn try_zeroed_f32_vec(what: &'static str, len: usize) -> Result<Vec<f32>, LoadError> {
     let mut v = Vec::new();
     v.try_reserve_exact(len)
         .map_err(|_| LoadError::Overflow { what })?;
@@ -589,34 +589,34 @@ pub struct State {
     /// Model configuration this state was allocated for. Checked at the entry
     /// of [`State::forward`] so mismatched `(State, Weights)` pairs return an
     /// error instead of panicking inside a layer.
-    config: Config,
+    pub(crate) config: Config,
     /// The residual stream. This is the vector that flows through the layers.
-    x: Vec<f32>,
+    pub(crate) x: Vec<f32>,
     /// Generic scratch for a normalised or projected activation.
-    xb: Vec<f32>,
+    pub(crate) xb: Vec<f32>,
     /// SwiGLU gate output (`w1 @ xb`).
-    hb: Vec<f32>,
+    pub(crate) hb: Vec<f32>,
     /// SwiGLU up output (`w3 @ xb`). Separate from `hb` because both are
     /// needed simultaneously to form `silu(gate) * up`.
-    hb2: Vec<f32>,
+    pub(crate) hb2: Vec<f32>,
     /// Query for this step, `n_heads * head_size`.
-    q: Vec<f32>,
+    pub(crate) q: Vec<f32>,
     /// Key for this step, `n_kv_heads * head_size`.
-    k: Vec<f32>,
+    pub(crate) k: Vec<f32>,
     /// Value for this step, `n_kv_heads * head_size`.
-    v: Vec<f32>,
+    pub(crate) v: Vec<f32>,
     /// Attention output for this step, `n_heads * head_size`, before `wo`.
-    att: Vec<f32>,
+    pub(crate) att: Vec<f32>,
     /// Final logits, `vocab_size`.
-    logits: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
     /// Attention score scratch, `seq_len`, reused across every head.
-    scores: Vec<f32>,
+    pub(crate) scores: Vec<f32>,
 
     /// `n_layers * seq_len * kv_dim`, row `l * seq_len + t` holding the keys
     /// for layer `l` at position `t`.
-    key_cache: Vec<f32>,
+    pub(crate) key_cache: Vec<f32>,
     /// Same layout, for values.
-    value_cache: Vec<f32>,
+    pub(crate) value_cache: Vec<f32>,
 }
 
 impl State {
@@ -901,18 +901,18 @@ impl SampleConfig {
 }
 
 /// Deterministic `xorshift64*` PRNG matching `llama2.c`'s `random_u32`.
-struct Rng {
+pub(crate) struct Rng {
     state: u64,
 }
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self {
             state: if seed == 0 { 1 } else { seed },
         }
     }
 
-    fn next_u32(&mut self) -> u32 {
+    pub(crate) fn next_u32(&mut self) -> u32 {
         let mut s = self.state;
         s ^= s >> 12;
         s ^= s << 25;
@@ -921,12 +921,12 @@ impl Rng {
         (s.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
     }
 
-    fn next_f32(&mut self) -> f32 {
+    pub(crate) fn next_f32(&mut self) -> f32 {
         (self.next_u32() >> 8) as f32 / 16_777_216.0
     }
 }
 
-fn select_next_token(
+pub(crate) fn select_next_token(
     logits: &[f32],
     pos: usize,
     sample: SampleConfig,

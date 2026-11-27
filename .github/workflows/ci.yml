@@ -212,9 +212,13 @@ jobs:
 
       # Six configurations: MHA, two levels of GQA, MQA, an untied classifier,
       # and a 128-token context. Each is exported with the reference's own
-      # legacy_export, run through PyTorch, and run through the engine.
-      - name: Differential test
+      # legacy_export (FP32) and version2_export (Q8_0), run through PyTorch,
+      # and compared against proofinfer.
+      - name: Differential test (FP32)
         run: python reference/diff_test.py
+
+      - name: Differential test (Q8_0 v2)
+        run: python reference/diff_test.py --q80
 
       # Injects ten realistic bugs and requires the harness above to fail on
       # every one. This is what makes the previous step mean something: a
@@ -276,12 +280,17 @@ jobs:
         run: python reference/diff_test.py --checkpoint stories15M.pt -n 200 --export-bin stories15M.bin
 
       # Compile vendored run.c with -O3 (no -ffast-math) and assert
-      # byte-identical greedy output on stories15M.bin.
+      # byte-identical greedy output on stories15M.bin, plus verify multi-thread
+      # persistent pool output matches single-threaded output byte-for-byte.
       - name: Byte-identical check against reference C run.c
         run: |
           set -euo pipefail
           cc -O3 -o run_O3 reference/llama2c/run.c -lm
           python reference/bench.py --model stories15M.bin --runs 1 --run-c "$PWD/run_O3"
+          ./target/release/proofinfer stories15M.bin -z reference/llama2c/tokenizer.bin -i "Once upon a time" -n 64 -t 1 > out_t1.txt
+          ./target/release/proofinfer stories15M.bin -z reference/llama2c/tokenizer.bin -i "Once upon a time" -n 64 -t 4 > out_t4.txt
+          cmp out_t1.txt out_t4.txt
+          rm -f out_t1.txt out_t4.txt
 
   # ---------------------------------------------------------------------------
   proof:

@@ -957,4 +957,188 @@ pub fn exec_forward_cache_write_and_layer_slice(
     }
 }
 
+// ===========================================================================
+// 8. Q8_0 quantized block and scale indexing bounds  (src/ops.rs)
+// ===========================================================================
+//
+// Proves that every `i8` weight block slice and `f32` per-group scale slice in
+// `ops.rs::dot_q80` and `ops.rs::matmul_q80` is non-empty, in bounds, and
+// overflow-free for any `d % group_size == 0`.
+
+/// `d / group_size` tiles `d` exactly when `d % group_size == 0`.
+pub proof fn lemma_q80_groups_tile_dim(d: int, group_size: int)
+    requires
+        d > 0,
+        group_size > 0,
+        d % group_size == 0,
+    ensures
+        (d / group_size) * group_size == d,
+        d / group_size > 0,
+{
+    lemma_fundamental_div_mod(d, group_size);
+    assert(d == group_size * (d / group_size) + d % group_size);
+    lemma_mul_is_commutative(group_size, d / group_size);
+    assert((d / group_size) * group_size == d);
+    if d / group_size <= 0 {
+        lemma_mul_inequality(d / group_size, 0, group_size);
+        assert((d / group_size) * group_size <= 0 * group_size);
+        assert(0 * group_size == 0) by (nonlinear_arith);
+        assert(d <= 0);
+        assert(false);
+    }
+}
+
+/// Every group slice `[g * group_size .. (g + 1) * group_size)` fits in `0..d`.
+pub proof fn lemma_q80_group_slice_in_row(d: int, group_size: int, g: int)
+    requires
+        d > 0,
+        group_size > 0,
+        d % group_size == 0,
+        0 <= g,
+        g < d / group_size,
+    ensures
+        0 <= g * group_size,
+        g * group_size < g * group_size + group_size,
+        g * group_size + group_size <= d,
+{
+    lemma_q80_groups_tile_dim(d, group_size);
+    lemma_mul_inequality(0, g, group_size);
+    assert(0 * group_size == 0) by (nonlinear_arith);
+    assert(0 <= g * group_size);
+    assert(g + 1 <= d / group_size);
+    lemma_mul_inequality(g + 1, d / group_size, group_size);
+    assert((g + 1) * group_size <= (d / group_size) * group_size);
+    assert(g * group_size + group_size == (g + 1) * group_size) by (nonlinear_arith);
+    assert(g * group_size + group_size <= d);
+}
+
+/// Every row `i < n` of a Q8_0 matrix has both its `i8` slice `[i*d..i*d+d)`
+/// and its scale slice `[i*row_groups..i*row_groups+row_groups)` in bounds.
+pub proof fn lemma_q80_row_and_scale_in_matrix(n: int, d: int, group_size: int, i: int)
+    requires
+        n > 0,
+        d > 0,
+        group_size > 0,
+        d % group_size == 0,
+        0 <= i,
+        i < n,
+    ensures
+        0 <= i * d,
+        i * d < i * d + d,
+        i * d + d <= n * d,
+        0 <= i * (d / group_size),
+        i * (d / group_size) < i * (d / group_size) + (d / group_size),
+        i * (d / group_size) + (d / group_size) <= n * (d / group_size),
+{
+    lemma_q80_groups_tile_dim(d, group_size);
+    lemma_layer_tensor_slice(n, d, i);
+    lemma_layer_tensor_slice(n, d / group_size, i);
+}
+
+/// `ops.rs::dot_q80`, executable slice and scale indexing over real `&[i8]`
+/// and `&[f32]` slices.
+pub fn exec_q80_dot_bounds(
+    wq: &[i8],
+    ws: &[f32],
+    xq: &[i8],
+    xs: &[f32],
+    d: usize,
+    group_size: usize,
+)
+    requires
+        d > 0,
+        group_size > 0,
+        d % group_size == 0,
+        wq.len() == d,
+        xq.len() == d,
+        ws.len() == d / group_size,
+        xs.len() == d / group_size,
+{
+    let n_groups = d / group_size;
+    let mut g: usize = 0;
+    while g < n_groups
+        invariant
+            g <= n_groups,
+            d > 0,
+            group_size > 0,
+            d % group_size == 0,
+            n_groups == d / group_size,
+            wq.len() == d,
+            xq.len() == d,
+            ws.len() == n_groups,
+            xs.len() == n_groups,
+        decreases n_groups - g,
+    {
+        proof {
+            lemma_q80_group_slice_in_row(d as int, group_size as int, g as int);
+            assert(d as int <= usize::MAX);
+            assert(g as int * group_size as int + group_size as int <= d as int);
+            assert(g as int * group_size as int <= usize::MAX);
+            assert(g as int * group_size as int + group_size as int <= usize::MAX);
+        }
+        let start = g * group_size;
+        let end = start + group_size;
+        let _wg = &wq[start..end];
+        let _xg = &xq[start..end];
+        let _ws = ws[g];
+        let _xs = xs[g];
+        g = g + 1;
+    }
+}
+
+/// `ops.rs::matmul_q80`, executable row/scale slicing composed directly with
+/// `exec_q80_dot_bounds` (`ops.rs::dot_q80`).
+pub fn exec_q80_matmul_bounds(
+    wq: &[i8],
+    ws: &[f32],
+    xq: &[i8],
+    xs: &[f32],
+    n: usize,
+    d: usize,
+    group_size: usize,
+)
+    requires
+        n > 0,
+        d > 0,
+        group_size > 0,
+        d % group_size == 0,
+        n as int * d as int <= usize::MAX,
+        n as int * (d as int / group_size as int) <= usize::MAX,
+        wq.len() == n * d,
+        ws.len() == n * (d / group_size),
+        xq.len() == d,
+        xs.len() == d / group_size,
+{
+    let row_groups = d / group_size;
+    let mut i: usize = 0;
+    while i < n
+        invariant
+            i <= n,
+            n > 0,
+            d > 0,
+            group_size > 0,
+            d % group_size == 0,
+            row_groups == d / group_size,
+            n as int * d as int <= usize::MAX,
+            n as int * row_groups as int <= usize::MAX,
+            wq.len() == n * d,
+            ws.len() == n * row_groups,
+            xq.len() == d,
+            xs.len() == row_groups,
+        decreases n - i,
+    {
+        proof {
+            lemma_q80_row_and_scale_in_matrix(n as int, d as int, group_size as int, i as int);
+            assert(i as int * d as int + d as int <= wq.len() as int);
+            assert(wq.len() as int <= usize::MAX);
+            assert(i as int * row_groups as int + row_groups as int <= ws.len() as int);
+            assert(ws.len() as int <= usize::MAX);
+        }
+        let q_row = &wq[i * d..i * d + d];
+        let s_row = &ws[i * row_groups..i * row_groups + row_groups];
+        exec_q80_dot_bounds(q_row, s_row, xq, xs, d, group_size);
+        i = i + 1;
+    }
+}
+
 } // verus!

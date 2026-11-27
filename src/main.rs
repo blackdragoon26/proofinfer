@@ -31,8 +31,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use proofinfer::model::{self, SampleConfig, State, Weights};
-use proofinfer::ops;
+use proofinfer::model::{self, SampleConfig, State};
+use proofinfer::pool;
+use proofinfer::quant::{self, Checkpoint, QuantizedState};
 use proofinfer::tokenizer::Tokenizer;
 
 const USAGE: &str = "\
@@ -340,12 +341,14 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
         Action::Run(a) => *a,
     };
 
-    ops::set_num_threads(args.threads);
-
-    let weights = Weights::load(&args.model)?;
-    let cfg = weights.config;
+    let checkpoint = Checkpoint::load(&args.model)?;
+    let cfg = checkpoint.config();
+    let quant_tag = match &checkpoint {
+        Checkpoint::Fp32(_) => " format=fp32".to_string(),
+        Checkpoint::Q80(w) => format!(" format=q8_0(gs={})", w.group_size),
+    };
     eprintln!(
-        "loaded {}: dim={} layers={} heads={} kv_heads={} vocab={} seq_len={}{}",
+        "loaded {}: dim={} layers={} heads={} kv_heads={} vocab={} seq_len={}{}{}",
         args.model.display(),
         cfg.dim,
         cfg.n_layers,
@@ -353,14 +356,13 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
         cfg.n_kv_heads,
         cfg.vocab_size,
         cfg.seq_len,
-        if weights.wcls.is_some() {
+        if checkpoint.is_untied() {
             " classifier=untied"
         } else {
             " classifier=tied"
-        }
+        },
+        quant_tag,
     );
-
-    let mut state = State::new(&cfg)?;
 
     match &args.tokens {
         // --- exact-token mode ---------------------------------------------
@@ -377,10 +379,60 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
             };
 
             let start = Instant::now();
-            for (pos, &token) in tokens.iter().enumerate() {
-                let logits = state.forward(&weights, token, pos)?;
-                if let Some(w) = dump.as_mut() {
-                    write_logits(w, logits)?;
+            match &checkpoint {
+                Checkpoint::Fp32(weights) => {
+                    let mut state = State::new(&cfg)?;
+                    if args.threads > 1 {
+                        pool::with_fp32_pool(
+                            weights,
+                            args.threads,
+                            |p| -> Result<(), Box<dyn Error>> {
+                                for (pos, &token) in tokens.iter().enumerate() {
+                                    let logits = pool::forward_fp32_pooled(
+                                        &mut state, weights, p, token, pos,
+                                    )?;
+                                    if let Some(w) = dump.as_mut() {
+                                        write_logits(w, logits)?;
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    } else {
+                        for (pos, &token) in tokens.iter().enumerate() {
+                            let logits = state.forward(weights, token, pos)?;
+                            if let Some(w) = dump.as_mut() {
+                                write_logits(w, logits)?;
+                            }
+                        }
+                    }
+                }
+                Checkpoint::Q80(weights) => {
+                    let mut state = QuantizedState::new(&cfg, weights.group_size)?;
+                    if args.threads > 1 {
+                        pool::with_q80_pool(
+                            weights,
+                            args.threads,
+                            |p| -> Result<(), Box<dyn Error>> {
+                                for (pos, &token) in tokens.iter().enumerate() {
+                                    let logits = pool::forward_q80_pooled(
+                                        &mut state, weights, p, token, pos,
+                                    )?;
+                                    if let Some(w) = dump.as_mut() {
+                                        write_logits(w, logits)?;
+                                    }
+                                }
+                                Ok(())
+                            },
+                        )?;
+                    } else {
+                        for (pos, &token) in tokens.iter().enumerate() {
+                            let logits = state.forward(weights, token, pos)?;
+                            if let Some(w) = dump.as_mut() {
+                                write_logits(w, logits)?;
+                            }
+                        }
+                    }
                 }
             }
             let elapsed = start.elapsed();
@@ -435,28 +487,69 @@ fn run(argv: &[String]) -> Result<ExitCode, Box<dyn Error>> {
             let mut io_err: Option<io::Error> = None;
             let generated_count = {
                 let mut out = io::stdout().lock();
-                model::generate_sampled_stream(
-                    &weights,
-                    &mut state,
-                    &prompt,
-                    args.num_tokens,
-                    args.sample,
-                    |token| {
-                        let bytes = tokenizer.decode_one_bytes(prev, token);
-                        prev = Some(token);
-                        match safe_print(&mut out, &bytes).and_then(|()| out.flush()) {
-                            Ok(()) => true,
-                            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
-                                broken_pipe = true;
-                                false
-                            }
-                            Err(e) => {
-                                io_err = Some(e);
-                                false
-                            }
+                let emit = |token: u32| -> bool {
+                    let bytes = tokenizer.decode_one_bytes(prev, token);
+                    prev = Some(token);
+                    match safe_print(&mut out, &bytes).and_then(|()| out.flush()) {
+                        Ok(()) => true,
+                        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                            broken_pipe = true;
+                            false
                         }
-                    },
-                )?
+                        Err(e) => {
+                            io_err = Some(e);
+                            false
+                        }
+                    }
+                };
+                match &checkpoint {
+                    Checkpoint::Fp32(weights) => {
+                        let mut state = State::new(&cfg)?;
+                        if args.threads > 1 {
+                            pool::generate_fp32_pooled_stream(
+                                weights,
+                                &mut state,
+                                &prompt,
+                                args.num_tokens,
+                                args.sample,
+                                args.threads,
+                                emit,
+                            )?
+                        } else {
+                            model::generate_sampled_stream(
+                                weights,
+                                &mut state,
+                                &prompt,
+                                args.num_tokens,
+                                args.sample,
+                                emit,
+                            )?
+                        }
+                    }
+                    Checkpoint::Q80(weights) => {
+                        let mut state = QuantizedState::new(&cfg, weights.group_size)?;
+                        if args.threads > 1 {
+                            pool::generate_q80_pooled_stream(
+                                weights,
+                                &mut state,
+                                &prompt,
+                                args.num_tokens,
+                                args.sample,
+                                args.threads,
+                                emit,
+                            )?
+                        } else {
+                            quant::generate_q80_sampled_stream(
+                                weights,
+                                &mut state,
+                                &prompt,
+                                args.num_tokens,
+                                args.sample,
+                                emit,
+                            )?
+                        }
+                    }
+                }
             };
             let elapsed = start.elapsed();
 

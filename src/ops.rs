@@ -306,6 +306,137 @@ pub fn matmul(o: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
     }
 }
 
+/// Borrowed view of a Q8_0 symmetric group-quantized tensor (`i8` values plus
+/// one `f32` scale factor per contiguous `group_size` block).
+#[derive(Debug, Clone, Copy)]
+pub struct QSlice<'a> {
+    pub q: &'a [i8],
+    pub s: &'a [f32],
+}
+
+/// Maximum Q8_0 group size accepted by the loader and quantized kernels.
+///
+/// Each `i8 * i8` product is at most `(-128) * (-128) = 16384`, so capping
+/// `group_size <= 65536` guarantees the inner `i32` block sum cannot exceed
+/// `65536 * 16384 = 1_073_741_824 < i32::MAX`.
+pub const Q80_MAX_GROUP_SIZE: usize = 65536;
+
+/// Symmetric Q8_0 quantization of `x` into `[-127, 127]` `i8` values with one
+/// `f32` scale factor per `group_size` elements, matching `llama2.c` `runq.c`.
+pub fn quantize_q80(q: &mut [i8], s: &mut [f32], x: &[f32], group_size: usize) {
+    debug_assert!(group_size > 0);
+    debug_assert_eq!(x.len() % group_size, 0);
+    debug_assert_eq!(q.len(), x.len());
+    debug_assert_eq!(s.len(), x.len() / group_size);
+
+    for (g, scale_slot) in s.iter_mut().enumerate() {
+        let start = g * group_size;
+        let end = start + group_size;
+        let x_group = &x[start..end];
+        let q_group = &mut q[start..end];
+
+        let mut wmax = 0.0f32;
+        for &v in x_group {
+            let a = v.abs();
+            if a > wmax {
+                wmax = a;
+            }
+        }
+        let scale = wmax / 127.0;
+        *scale_slot = scale;
+        if scale == 0.0 {
+            q_group.fill(0);
+        } else {
+            for i in 0..group_size {
+                q_group[i] = (x_group[i] / scale).round().clamp(-127.0, 127.0) as i8;
+            }
+        }
+    }
+}
+
+/// Dequantize a Q8_0 tensor into `out`, reversing `quantize_q80`.
+pub fn dequantize_q80(out: &mut [f32], w: QSlice<'_>, group_size: usize) {
+    debug_assert!(group_size > 0);
+    debug_assert_eq!(w.q.len() % group_size, 0);
+    debug_assert_eq!(out.len(), w.q.len());
+    debug_assert_eq!(w.s.len(), w.q.len() / group_size);
+
+    let n_groups = w.q.len() / group_size;
+    for g in 0..n_groups {
+        let start = g * group_size;
+        let end = start + group_size;
+        let scale = w.s[g];
+        let q_group = &w.q[start..end];
+        let out_group = &mut out[start..end];
+        for i in 0..group_size {
+            out_group[i] = q_group[i] as f32 * scale;
+        }
+    }
+}
+
+/// Dot product of two Q8_0-quantized length-`d` vectors.
+///
+/// Accumulates `i8 * i8` products in `i32` within each `group_size` block and
+/// scales once per group by `w.s[g] * x.s[g]`.
+#[inline]
+pub fn dot_q80(w: QSlice<'_>, x: QSlice<'_>, d: usize, group_size: usize) -> f32 {
+    debug_assert!(group_size > 0);
+    debug_assert!(group_size <= Q80_MAX_GROUP_SIZE);
+    debug_assert_eq!(d % group_size, 0);
+    debug_assert_eq!(w.q.len(), d);
+    debug_assert_eq!(x.q.len(), d);
+    debug_assert_eq!(w.s.len(), d / group_size);
+    debug_assert_eq!(x.s.len(), d / group_size);
+
+    let n_groups = d / group_size;
+    let mut total = 0.0f32;
+    for g in 0..n_groups {
+        let start = g * group_size;
+        let end = start + group_size;
+        let wg = &w.q[start..end];
+        let xg = &x.q[start..end];
+        let (mut wi, mut xi) = (wg.chunks_exact(DOT_LANES), xg.chunks_exact(DOT_LANES));
+        let mut acc = [0i32; DOT_LANES];
+        for (cw, cx) in wi.by_ref().zip(xi.by_ref()) {
+            for lane in 0..DOT_LANES {
+                acc[lane] += (cw[lane] as i32) * (cx[lane] as i32);
+            }
+        }
+        let mut ival: i32 = acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
+        for (&a, &b) in wi.remainder().iter().zip(xi.remainder()) {
+            ival += (a as i32) * (b as i32);
+        }
+        total += (ival as f32) * w.s[g] * x.s[g];
+    }
+    total
+}
+
+/// `out = W @ x` where both `W` (`n x d`, row-major) and `x` (`d`) are Q8_0
+/// quantized with block size `group_size`.
+pub fn matmul_q80(
+    o: &mut [f32],
+    x: QSlice<'_>,
+    w: QSlice<'_>,
+    n: usize,
+    d: usize,
+    group_size: usize,
+) {
+    debug_assert!(group_size > 0);
+    debug_assert_eq!(d % group_size, 0);
+    debug_assert_eq!(o.len(), n);
+    debug_assert_eq!(x.q.len(), d);
+    debug_assert_eq!(x.s.len(), d / group_size);
+    debug_assert_eq!(w.q.len(), n * d);
+    let row_groups = d / group_size;
+    debug_assert_eq!(w.s.len(), n * row_groups);
+
+    for i in 0..n {
+        let q_row = &w.q[i * d..i * d + d];
+        let s_row = &w.s[i * row_groups..i * row_groups + row_groups];
+        o[i] = dot_q80(QSlice { q: q_row, s: s_row }, x, d, group_size);
+    }
+}
+
 /// Rotary positional embedding, applied in place to a packed `(n_heads,
 /// head_size)` vector.
 ///
@@ -1066,5 +1197,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn q80_round_trip_and_matmul_match_dequantized_fp32() {
+        let n = 12usize;
+        let d = 64usize;
+        let gs = 32usize;
+        let w_fp32: Vec<f32> = (0..n * d)
+            .map(|i| ((i as f32) * 0.23).sin() * 2.5)
+            .collect();
+        let x_fp32: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.41).cos() * 1.5).collect();
+
+        let mut wq = vec![0i8; n * d];
+        let mut ws = vec![0.0f32; n * (d / gs)];
+        quantize_q80(&mut wq, &mut ws, &w_fp32, gs);
+
+        let mut xq = vec![0i8; d];
+        let mut xs = vec![0.0f32; d / gs];
+        quantize_q80(&mut xq, &mut xs, &x_fp32, gs);
+
+        let mut w_deq = vec![0.0f32; n * d];
+        let mut x_deq = vec![0.0f32; d];
+        dequantize_q80(&mut w_deq, QSlice { q: &wq, s: &ws }, gs);
+        dequantize_q80(&mut x_deq, QSlice { q: &xq, s: &xs }, gs);
+
+        // Quantized matmul must match fp32 matmul on the dequantized operands
+        // tightly (only differing by f32 summation order).
+        let mut out_q = vec![0.0f32; n];
+        let mut out_ref = vec![0.0f32; n];
+        matmul_q80(
+            &mut out_q,
+            QSlice { q: &xq, s: &xs },
+            QSlice { q: &wq, s: &ws },
+            n,
+            d,
+            gs,
+        );
+        matmul(&mut out_ref, &x_deq, &w_deq, n, d);
+        for i in 0..n {
+            assert_close(out_q[i], out_ref[i], 1e-5);
+        }
+
+        // All-zero group must produce zero scales and zero quants (no NaN).
+        let zeros = vec![0.0f32; gs];
+        let mut zq = vec![7i8; gs];
+        let mut zs = vec![1.0f32; 1];
+        quantize_q80(&mut zq, &mut zs, &zeros, gs);
+        assert_eq!(zs, [0.0]);
+        assert!(zq.iter().all(|&v| v == 0));
     }
 }

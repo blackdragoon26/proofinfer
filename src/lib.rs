@@ -9,10 +9,14 @@
 //!
 //! Module map:
 //!
-//! * [`ops`]       - numeric kernels (rmsnorm, softmax, silu, matmul, RoPE, GQA)
-//! * [`model`]     - config, checkpoint loading, scratch + KV cache, forward
+//! * [`ops`]       - numeric kernels (rmsnorm, softmax, silu, matmul, Q8_0, RoPE, GQA)
+//! * [`model`]     - config, FP32 checkpoint loading, scratch + KV cache, forward
+//! * [`quant`]     - Q8_0 v2 quantized checkpoint loading and inference
+//! * [`pool`]      - zero-dependency persistent worker pool for row-partitioned matmul
 //! * [`tokenizer`] - the Llama 2 BPE vocabulary reader and encoder
 
 pub mod model;
 pub mod ops;
+pub mod pool;
+pub mod quant;
 pub mod tokenizer;

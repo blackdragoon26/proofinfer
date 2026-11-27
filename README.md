@@ -22,20 +22,20 @@ Full detail, including how each check was shown to be able to fail, is in
 
 | | |
 |---|---|
-| Differential, 6 configurations | 6/6 pass, max error 1.0e-5, top-1 100% |
-| Real `stories15M` weights | 200/200 top-1, max error 3.3e-5 |
-| Greedy output vs `run.c` | byte-identical at `-O3` and `-Ofast` |
+| Differential, 6 FP32 + 6 Q8_0 configs | 6/6 FP32 (max err 1.0e-5, 100% top-1) + 6/6 Q8_0 v2 |
+| Real `stories15M` weights | 200/200 top-1, max error 3.3e-5; Q8_0 v2 shrinks 58 MB to 17 MB |
+| Greedy output vs `run.c` | byte-identical at `-O3` and `-Ofast` (and `-t 1 == -t 4`) |
 | Mutation: differential harness | 10/10 caught |
 | Mutation: Rust test suite | 21/21 caught |
-| Verus `--no-cheating` | 36 verified, 0 errors |
-| Rust tests | 90, green in debug **and** release (MSRV 1.70.0) |
-| Throughput | 835 tok/s single-threaded (5.4x over the naive dot product; optional `-t/--threads`) |
+| Verus `--no-cheating` | 46 verified, 0 errors (KV-cache, `Weights::layer`, Q8_0 bounds) |
+| Rust tests | 96, green in debug **and** release (MSRV 1.70.0) |
+| Throughput | 835 tok/s single-threaded on M3 (5.4x over naive dot; optional persistent pool `-t/--threads` and Q8_0) |
 
 ## Quick start
 
 ```sh
 cargo build --release --locked
-cargo test --locked                     # 90 tests (debug + release)
+cargo test --locked                     # 96 tests (debug + release)
 ```
 
 Generate from text, with a real checkpoint:
@@ -88,7 +88,8 @@ python3 -m venv .venv
     --index-url https://download.pytorch.org/whl/cpu \
     --extra-index-url https://pypi.org/simple
 
-.venv/bin/python reference/diff_test.py            # 6/6 vs PyTorch
+.venv/bin/python reference/diff_test.py            # 6/6 FP32 vs PyTorch
+.venv/bin/python reference/diff_test.py --q80      # 6/6 Q8_0 v2 vs PyTorch
 .venv/bin/python reference/mutation_check.py       # 10/10 caught
 .venv/bin/python reference/diff_test.py --checkpoint stories15M.pt -n 200 --export-bin stories15M.bin
 cc -O3 -o run_O3 reference/llama2c/run.c -lm
@@ -108,7 +109,7 @@ See [verus/README.md](verus/README.md) section 4 for pinned Verus downloads
 | [docs/performance.md](docs/performance.md) | the 8-lane dot product, the measurement method, and the gap left by `-Ofast` |
 | [docs/design.md](docs/design.md) | architecture, the decisions worth defending, trusted computing base, and what is *not* verified |
 | [CONTEXT.md](CONTEXT.md) | working design notes kept during the build |
-| [verus/README.md](verus/README.md) | the formal proof (36 VCs, KV-cache + `State::new` + `Weights::layer`), its scope, and its explicit limits (also rendered at [site/proof.html](site/proof.html)) |
+| [verus/README.md](verus/README.md) | the formal proof (46 VCs, KV-cache + `State::new` + `Weights::layer` + Q8_0 bounds), its scope, and its explicit limits (also rendered at [site/proof.html](site/proof.html)) |
 | [site/](site/) | the landing page — static, generated from `verus/README.md` and `docs/`, no build step |
 
 ## Honest limits
