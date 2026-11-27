@@ -695,10 +695,17 @@ fn sampled_generation_is_deterministic_and_validates_config() {
     };
     let run_sampled = |c: SampleConfig| -> Vec<u32> {
         let mut out = Vec::new();
-        generate_sampled_stream(&w, &mut State::new(&w.config).unwrap(), &prompt, 8, c, |t| {
-            out.push(t);
-            true
-        })
+        generate_sampled_stream(
+            &w,
+            &mut State::new(&w.config).unwrap(),
+            &prompt,
+            8,
+            c,
+            |t| {
+                out.push(t);
+                true
+            },
+        )
         .unwrap();
         out
     };

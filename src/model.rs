@@ -96,7 +96,10 @@ impl fmt::Display for RunError {
             RunError::EmptyPrompt => write!(f, "the prompt contains no tokens"),
             RunError::StateMismatch { detail } => write!(f, "state mismatch: {detail}"),
             RunError::NonFiniteLogit { pos } => {
-                write!(f, "non-finite (NaN or inf) logit produced at position {pos}")
+                write!(
+                    f,
+                    "non-finite (NaN or inf) logit produced at position {pos}"
+                )
             }
             RunError::InvalidSampleConfig { detail } => {
                 write!(f, "invalid sampling configuration: {detail}")

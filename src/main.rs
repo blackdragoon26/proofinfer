@@ -616,19 +616,8 @@ mod tests {
         let argv = |xs: &[&str]| -> Vec<String> { xs.iter().map(|s| (*s).to_string()).collect() };
 
         let action = parse_args(&argv(&[
-            "m.bin",
-            "-z",
-            "t.bin",
-            "-i",
-            "hi",
-            "-t",
-            "4",
-            "--temp",
-            "0.8",
-            "--top-p",
-            "0.95",
-            "--seed",
-            "42",
+            "m.bin", "-z", "t.bin", "-i", "hi", "-t", "4", "--temp", "0.8", "--top-p", "0.95",
+            "--seed", "42",
         ]))
         .unwrap();
         match action {
